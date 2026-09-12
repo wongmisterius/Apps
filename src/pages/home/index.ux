@@ -1,0 +1,360 @@
+<template>
+  <div class="page">
+
+    <!-- Estado: viva -->
+    <div if="{{alive}}" class="stage-row">
+      <text class="stage-label">{{stageLabel}}</text>
+      <text if="{{sick}}" class="sick-label">Enferma</text>
+      <text if="{{sleeping}}" class="sick-label">Durmiendo</text>
+    </div>
+
+    <div if="{{alive}}" class="pet-box">
+      <div class="pet-face {{faceMood}}">
+        <div class="eye eye-l"></div>
+        <div class="eye eye-r"></div>
+        <div class="mouth {{mouthMood}}"></div>
+      </div>
+    </div>
+
+    <div if="{{alive}}" class="bars">
+      <div class="bar-row">
+        <text class="bar-icon">Hambre</text>
+        <div class="bar-track">
+          <div class="bar-fill" style="width: {{hunger}}%; background-color: #ff8a5c;"></div>
+        </div>
+      </div>
+      <div class="bar-row">
+        <text class="bar-icon">Animo</text>
+        <div class="bar-track">
+          <div class="bar-fill" style="width: {{happiness}}%; background-color: #ffd23f;"></div>
+        </div>
+      </div>
+      <div class="bar-row">
+        <text class="bar-icon">Energia</text>
+        <div class="bar-track">
+          <div class="bar-fill" style="width: {{energy}}%; background-color: #5cc8ff;"></div>
+        </div>
+      </div>
+      <div class="bar-row">
+        <text class="bar-icon">Limpieza</text>
+        <div class="bar-track">
+          <div class="bar-fill" style="width: {{clean}}%; background-color: #7be27b;"></div>
+        </div>
+      </div>
+    </div>
+
+    <div if="{{alive}}" class="actions">
+      <div class="action-btn" onclick="doFeed">
+        <text class="action-txt">Comer</text>
+      </div>
+      <div class="action-btn" onclick="doPlay">
+        <text class="action-txt">Jugar</text>
+      </div>
+      <div class="action-btn" onclick="doClean">
+        <text class="action-txt">Limpiar</text>
+      </div>
+      <div class="action-btn" onclick="doSleep">
+        <text class="action-txt">{{sleeping ? 'Despertar' : 'Dormir'}}</text>
+      </div>
+    </div>
+
+    <!-- Estado: murió -->
+    <div if="{{!alive}}" class="dead-box">
+      <text class="dead-title">Tu mascota se fue</text>
+      <text class="dead-sub">Vivio {{ageLabel}}</text>
+      <div class="action-btn wide" onclick="doReset">
+        <text class="action-txt">Nuevo huevo</text>
+      </div>
+    </div>
+
+  </div>
+</template>
+
+<style>
+  .page {
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+    width: 100%;
+    height: 100%;
+    background-color: #10131a;
+    padding-top: 8px;
+  }
+
+  .stage-row {
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .stage-label {
+    color: #ffffff;
+    font-size: 20px;
+    font-weight: bold;
+    margin-right: 8px;
+  }
+
+  .sick-label {
+    color: #ff5c5c;
+    font-size: 16px;
+  }
+
+  .pet-box {
+    width: 140px;
+    height: 140px;
+    align-items: center;
+    justify-content: center;
+    margin-top: 6px;
+    margin-bottom: 6px;
+  }
+
+  .pet-face {
+    width: 120px;
+    height: 120px;
+    border-radius: 60px;
+    background-color: #ffd23f;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .pet-face.mood-sick {
+    background-color: #9fae7a;
+  }
+
+  .pet-face.mood-sad {
+    background-color: #e0b93f;
+  }
+
+  .pet-face.mood-sleep {
+    background-color: #6f7aa8;
+  }
+
+  .eye {
+    width: 12px;
+    height: 12px;
+    border-radius: 6px;
+    background-color: #10131a;
+    position: absolute;
+    margin-top: -20px;
+  }
+
+  .eye-l {
+    margin-left: -25px;
+  }
+
+  .eye-r {
+    margin-left: 25px;
+  }
+
+  .mouth {
+    width: 30px;
+    height: 12px;
+    margin-top: 20px;
+    background-color: #10131a;
+    border-radius: 6px;
+  }
+
+  .mouth.mood-sad {
+    height: 4px;
+    margin-top: 24px;
+  }
+
+  .bars {
+    width: 90%;
+    flex-direction: column;
+  }
+
+  .bar-row {
+    flex-direction: row;
+    align-items: center;
+    margin-top: 3px;
+  }
+
+  .bar-icon {
+    width: 60px;
+    color: #cfd6e6;
+    font-size: 13px;
+  }
+
+  .bar-track {
+    flex: 1;
+    height: 8px;
+    border-radius: 4px;
+    background-color: #2a2f3d;
+  }
+
+  .bar-fill {
+    height: 8px;
+    border-radius: 4px;
+  }
+
+  .actions {
+    flex-direction: row;
+    flex-wrap: wrap;
+    justify-content: center;
+    width: 100%;
+    margin-top: 8px;
+  }
+
+  .action-btn {
+    width: 72px;
+    height: 32px;
+    border-radius: 16px;
+    background-color: #2a2f3d;
+    align-items: center;
+    justify-content: center;
+    margin: 4px;
+  }
+
+  .action-btn.wide {
+    width: 140px;
+  }
+
+  .action-txt {
+    color: #ffffff;
+    font-size: 13px;
+  }
+
+  .dead-box {
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    margin-top: 40px;
+  }
+
+  .dead-title {
+    color: #ff8a8a;
+    font-size: 18px;
+    font-weight: bold;
+  }
+
+  .dead-sub {
+    color: #cfd6e6;
+    font-size: 13px;
+    margin-top: 6px;
+    margin-bottom: 12px;
+  }
+</style>
+
+<script>
+  import storage from '@system.storage';
+  import pet from '../../common/pet.js';
+
+  export default {
+    data: {
+      alive: true,
+      sick: false,
+      sleeping: false,
+      stageLabel: 'Huevo',
+      ageLabel: '',
+      faceMood: '',
+      mouthMood: '',
+      hunger: 80,
+      happiness: 80,
+      energy: 80,
+      clean: 100
+    },
+
+    _timer: null,
+    _state: null,
+
+    onInit() {
+      pet.bindStorage(storage);
+    },
+
+    onShow() {
+      this.refresh();
+      this._timer = setInterval(() => this.refresh(), 5000);
+    },
+
+    onHide() {
+      this.stopTimer();
+      if (this._state) pet.save(this._state);
+    },
+
+    onDestroy() {
+      this.stopTimer();
+    },
+
+    stopTimer() {
+      if (this._timer) {
+        clearInterval(this._timer);
+        this._timer = null;
+      }
+    },
+
+    refresh() {
+      pet.load().then((state) => {
+        this._state = state;
+        this.render(state);
+        pet.save(state);
+      });
+    },
+
+    render(state) {
+      const stageNames = {
+        egg: 'Huevo',
+        baby: 'Cria',
+        child: 'Joven',
+        adult: 'Adulta'
+      };
+      const stage = pet.stageFor(state.ageMinutes);
+
+      let mood = '';
+      if (state.sick) mood = 'mood-sick';
+      else if (state.sleeping) mood = 'mood-sleep';
+      else if (state.happiness < 35 || state.hunger < 25) mood = 'mood-sad';
+
+      this.stageLabel = stageNames[stage] || 'Huevo';
+      this.alive = state.alive;
+      this.sick = state.sick;
+      this.sleeping = state.sleeping;
+      this.faceMood = mood;
+      this.mouthMood = (state.happiness < 35 || state.hunger < 25 || state.sick) ? 'mood-sad' : '';
+      this.hunger = Math.round(state.hunger);
+      this.happiness = Math.round(state.happiness);
+      this.energy = Math.round(state.energy);
+      this.clean = Math.round(state.clean);
+
+      if (!state.alive) {
+        const hours = Math.floor(state.ageMinutes / 60);
+        this.ageLabel = hours > 0 ? (hours + ' hs') : (Math.round(state.ageMinutes) + ' min');
+      }
+    },
+
+    doFeed() {
+      if (!this._state) return;
+      this._state = pet.feed(this._state);
+      this.render(this._state);
+      pet.save(this._state);
+    },
+
+    doPlay() {
+      if (!this._state) return;
+      this._state = pet.play(this._state);
+      this.render(this._state);
+      pet.save(this._state);
+    },
+
+    doClean() {
+      if (!this._state) return;
+      this._state = pet.clean(this._state);
+      this.render(this._state);
+      pet.save(this._state);
+    },
+
+    doSleep() {
+      if (!this._state) return;
+      this._state = pet.toggleSleep(this._state);
+      this.render(this._state);
+      pet.save(this._state);
+    },
+
+    doReset() {
+      this._state = pet.reset();
+      this.render(this._state);
+      pet.save(this._state);
+    }
+  };
+</script>

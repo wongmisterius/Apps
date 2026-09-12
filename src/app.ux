@@ -1,0 +1,10 @@
+<script>
+export default {
+  onCreate() {
+    console.log('App onCreate: Mascota Virtual');
+  },
+  onDestroy() {
+    console.log('App onDestroy');
+  }
+}
+</script>

@@ -1,0 +1,7 @@
+node_modules/
+dist/
+build/
+sign/private.pem
+sign/*.p7b
+sign/*.cer
+*.log

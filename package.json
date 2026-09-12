@@ -1,0 +1,14 @@
+{
+  "name": "tamagotchi-gt3",
+  "version": "1.0.0",
+  "description": "Mascota virtual (tipo Tamagotchi) - Quick App para Huawei Watch GT3",
+  "scripts": {
+    "watch": "hap watch",
+    "build": "hap build",
+    "release": "hap release",
+    "server": "hap server"
+  },
+  "devDependencies": {
+    "hap-toolkit": "^1.6.0"
+  }
+}
