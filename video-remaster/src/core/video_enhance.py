@@ -7,11 +7,11 @@ import torch
 
 MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
 
-# nombre visible -> (archivo .pth, factor de escala del modelo)
+# nombre visible -> (archivo .pth, factor de escala del modelo, bloques RRDB [solo RRDBNet])
 MODEL_CATALOG = {
-    "realesr-general-x4v3": ("realesr-general-x4v3.pth", 4),   # rápido, uso general
-    "RealESRGAN_x4plus": ("RealESRGAN_x4plus.pth", 4),          # más calidad, más lento
-    "RealESRGAN_x4plus_anime_6B": ("RealESRGAN_x4plus_anime_6B.pth", 4),  # animación
+    "realesr-general-x4v3": ("realesr-general-x4v3.pth", 4, None),      # rápido, uso general (SRVGGNetCompact)
+    "RealESRGAN_x4plus": ("RealESRGAN_x4plus.pth", 4, 23),               # más calidad, más lento
+    "RealESRGAN_x4plus_anime_6B": ("RealESRGAN_x4plus_anime_6B.pth", 4, 6),  # animación
 }
 
 
@@ -25,7 +25,7 @@ class VideoUpscaler:
         from realesrgan import RealESRGANer
         from realesrgan.archs.srvgg_arch import SRVGGNetCompact
 
-        weight_file, native_scale = MODEL_CATALOG[model_name]
+        weight_file, native_scale, num_block = MODEL_CATALOG[model_name]
         weight_path = MODELS_DIR / weight_file
         if not weight_path.exists():
             raise FileNotFoundError(
@@ -39,12 +39,12 @@ class VideoUpscaler:
                 "instalá los drivers NVIDIA y el PyTorch con soporte CUDA (ver README)."
             )
 
-        if model_name == "realesr-general-x4v3":
+        if num_block is None:
             # Este checkpoint es una red compacta (SRVGGNetCompact), no RRDBNet.
             arch = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64,
                                     num_conv=32, upscale=native_scale, act_type="prelu")
         else:
-            arch = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23,
+            arch = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=num_block,
                             num_grow_ch=32, scale=native_scale)
 
         self._upsampler = RealESRGANer(

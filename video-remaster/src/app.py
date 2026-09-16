@@ -5,9 +5,9 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QGridLayout, QLabel,
-    QMainWindow, QMessageBox, QProgressBar, QPushButton, QSpinBox, QTextEdit,
-    QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout,
+    QLabel, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSpinBox,
+    QTextEdit, QVBoxLayout, QWidget,
 )
 
 from .core.pipeline import RemasterOptions, remaster
@@ -43,6 +43,7 @@ class MainWindow(QMainWindow):
         self.resize(640, 480)
 
         self.input_path: Path | None = None
+        self.output_path: Path | None = None
         self.worker: RemasterWorker | None = None
 
         root = QWidget()
@@ -54,6 +55,12 @@ class MainWindow(QMainWindow):
         btn_pick.clicked.connect(self.pick_input)
         layout.addWidget(btn_pick)
         layout.addWidget(self.input_label)
+
+        self.output_label = QLabel("Sin ruta de salida")
+        btn_pick_output = QPushButton("Elegir ruta de salida...")
+        btn_pick_output.clicked.connect(self.pick_output)
+        layout.addWidget(btn_pick_output)
+        layout.addWidget(self.output_label)
 
         form = QGridLayout()
         row = 0
@@ -85,7 +92,16 @@ class MainWindow(QMainWindow):
 
         self.normalize_check = QCheckBox("Normalizar loudness")
         self.normalize_check.setChecked(True)
+        self.normalize_check.toggled.connect(lambda on: self.lufs_spin.setEnabled(on))
         form.addWidget(self.normalize_check, row, 0, 1, 2)
+        row += 1
+
+        form.addWidget(QLabel("Target loudness (LUFS):"), row, 0)
+        self.lufs_spin = QDoubleSpinBox()
+        self.lufs_spin.setRange(-40.0, -5.0)
+        self.lufs_spin.setSingleStep(1.0)
+        self.lufs_spin.setValue(-16.0)
+        form.addWidget(self.lufs_spin, row, 1)
         row += 1
 
         layout.addLayout(form)
@@ -109,16 +125,28 @@ class MainWindow(QMainWindow):
         if path:
             self.input_path = Path(path)
             self.input_label.setText(str(self.input_path))
-            self.start_btn.setEnabled(True)
+            if not self.output_path:
+                self.output_path = self.input_path.with_name(
+                    self.input_path.stem + "_remaster.mp4")
+                self.output_label.setText(str(self.output_path))
+            self._update_start_enabled()
+
+    def pick_output(self) -> None:
+        default = str(self.output_path) if self.output_path else (
+            str(self.input_path.with_name(self.input_path.stem + "_remaster.mp4"))
+            if self.input_path else "salida.mp4"
+        )
+        out_path, _ = QFileDialog.getSaveFileName(self, "Guardar como", default, "MP4 (*.mp4)")
+        if out_path:
+            self.output_path = Path(out_path)
+            self.output_label.setText(str(self.output_path))
+            self._update_start_enabled()
+
+    def _update_start_enabled(self) -> None:
+        self.start_btn.setEnabled(self.input_path is not None and self.output_path is not None)
 
     def start_remaster(self) -> None:
-        if not self.input_path:
-            return
-        out_path, _ = QFileDialog.getSaveFileName(
-            self, "Guardar como", str(self.input_path.with_name(
-                self.input_path.stem + "_remaster.mp4")), "MP4 (*.mp4)"
-        )
-        if not out_path:
+        if not self.input_path or not self.output_path:
             return
 
         opts = RemasterOptions(
@@ -127,13 +155,14 @@ class MainWindow(QMainWindow):
             tile=self.tile_spin.value(),
             denoise_audio=self.denoise_check.isChecked(),
             normalize_audio=self.normalize_check.isChecked(),
+            target_lufs=self.lufs_spin.value(),
         )
 
         self.start_btn.setEnabled(False)
         self.progress_bar.setValue(0)
         self.log.append(f"Iniciando remaster de {self.input_path.name}...")
 
-        self.worker = RemasterWorker(self.input_path, Path(out_path), opts)
+        self.worker = RemasterWorker(self.input_path, self.output_path, opts)
         self.worker.progress.connect(self.on_progress)
         self.worker.finished_ok.connect(self.on_finished)
         self.worker.failed.connect(self.on_failed)
