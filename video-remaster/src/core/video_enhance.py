@@ -23,6 +23,7 @@ class VideoUpscaler:
 
         from basicsr.archs.rrdbnet_arch import RRDBNet
         from realesrgan import RealESRGANer
+        from realesrgan.archs.srvgg_arch import SRVGGNetCompact
 
         weight_file, native_scale = MODEL_CATALOG[model_name]
         weight_path = MODELS_DIR / weight_file
@@ -38,8 +39,13 @@ class VideoUpscaler:
                 "instalá los drivers NVIDIA y el PyTorch con soporte CUDA (ver README)."
             )
 
-        arch = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23,
-                        num_grow_ch=32, scale=native_scale)
+        if model_name == "realesr-general-x4v3":
+            # Este checkpoint es una red compacta (SRVGGNetCompact), no RRDBNet.
+            arch = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64,
+                                    num_conv=32, upscale=native_scale, act_type="prelu")
+        else:
+            arch = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23,
+                            num_grow_ch=32, scale=native_scale)
 
         self._upsampler = RealESRGANer(
             scale=native_scale,

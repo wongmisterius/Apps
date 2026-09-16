@@ -21,8 +21,8 @@ class AudioEnhancer:
         from df.enhance import enhance, load_audio, save_audio
 
         audio, _ = load_audio(str(in_wav), sr=self._df_state.sr())
-        if self.device == "cuda":
-            audio = audio.to("cuda")
+        # `enhance()` mueve internamente al device del modelo para la red neuronal,
+        # pero el análisis STFT (df.analysis) requiere el tensor de entrada en CPU.
         enhanced = enhance(self._model, self._df_state, audio)
         save_audio(str(out_wav), enhanced, self._df_state.sr())
 
