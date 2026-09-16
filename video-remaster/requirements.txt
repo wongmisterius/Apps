@@ -1,7 +1,5 @@
-# Instalar PyTorch con CUDA aparte (ver README), estos son el resto de deps.
---extra-index-url https://download.pytorch.org/whl/cu121
-torch==2.3.1+cu121
-torchvision==0.18.1+cu121
+# PyTorch con CUDA se instala APARTE, antes que este archivo (ver README) --
+# la version exacta depende de tu driver NVIDIA, por eso no se pinea aca.
 
 # Upscale / restauración de video (GPU)
 realesrgan==0.3.0

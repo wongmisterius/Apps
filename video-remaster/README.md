@@ -23,15 +23,29 @@ Todo corre 100% local, sin subir nada a internet.
 cd video-remaster
 python -m venv .venv
 .venv\Scripts\activate
+
+# 1) Instalar PyTorch con CUDA PRIMERO (versión exacta según tu driver).
+#    Fijate qué CUDA soporta tu driver con: nvidia-smi (esquina sup. derecha)
+#    y usá el comando que te arme https://pytorch.org/get-started/locally/
+#    (Stable / Windows / Pip / Python / CUDA 12.x). Ejemplo típico hoy:
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+# 2) Resto de dependencias
 pip install -r requirements.txt
 
-# Descarga los pesos de Real-ESRGAN (una sola vez, ~70-130 MB cada uno)
+# 3) Descarga los pesos de Real-ESRGAN (una sola vez, ~70-130 MB cada uno)
 python scripts\download_models.py
 ```
 
-Si `pip install torch==...+cu121` falla, revisá que tu GPU/driver soporten
-CUDA 12.1 o ajustá la versión de `+cu121` en `requirements.txt` según la
-tabla de https://pytorch.org/get-started/locally/.
+Verificá que Torch ve la GPU antes de seguir:
+
+```powershell
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+Si `torch.cuda.is_available()` da `False`, el problema es la combinación
+driver/CUDA/torch, no el resto de la app — no sigas con la instalación
+hasta que esto de `True`.
 
 ## Uso
 
