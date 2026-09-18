@@ -46,11 +46,27 @@ profundidad de 64×64).
 ```bash
 ./gradlew assembleDebug     # genera app/build/outputs/apk/debug/app-debug.apk
 ./gradlew installDebug      # instala en un dispositivo/emulador conectado
+
+# APK más liviano (R8 + shrink de recursos, firmado con la clave de debug
+# para poder instalarlo sin configurar un keystore propio):
+./gradlew assembleRelease   # genera app/build/outputs/apk/release/app-release.apk
 ```
 
 Para probar el efecto de paralaje hace falta un dispositivo físico (el
 emulador no simula bien el sensor de rotación); apuntá a una persona u
 objeto con fondo despejado para que la segmentación separe bien los planos.
+
+El paquete solo incluye la arquitectura `arm64-v8a` (todos los celulares
+Android de los últimos ~8 años) para mantener el APK liviano; para probar
+en un emulador x86_64 agregá esa arquitectura en `abiFilters` dentro de
+`app/build.gradle.kts`.
+
+### Instalar el APK manualmente
+
+1. Copiá el `.apk` al teléfono (por cable, Drive, WhatsApp, etc).
+2. Abrilo desde el explorador de archivos del teléfono.
+3. Si Android bloquea la instalación, activá "Instalar apps desconocidas"
+   para esa app (Config → Apps → acceso especial), y volvé a intentar.
 
 ## Limitaciones conocidas
 

@@ -13,12 +13,22 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+        ndk {
+            // Reduce el tamaño del APK empaquetando solo la arquitectura de
+            // celulares reales (arm64-v8a cubre prácticamente todos los
+            // dispositivos modernos); x86/x86_64 solo hacen falta para emuladores.
+            abiFilters += "arm64-v8a"
+        }
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            // Firma con la misma clave de debug para poder instalarla directamente
+            // sin generar un keystore de release aparte.
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
