@@ -1,7 +1,7 @@
 # Tomodachi Life: Living the Dream en NX on Orbis
 
 Continuación del port con un objetivo concreto: que *Tomodachi Life: Living the Dream* (Switch,
-2026) arranque y se pueda jugar en una PS4 Pro. Se prueba en una PS4 Pro con **FW 11.00 + GoldHEN**
+2026) arranque y se pueda jugar en una PS4 Pro. Se prueba en una PS4 Pro con **FW 13.52 + GoldHEN**
 (el port original solo se probó en 12.02).
 
 ## Qué cambió respecto de v0.1.0 ("tl1")
@@ -57,5 +57,5 @@ Líneas nuevas en `boot.log`:
   que Mario Kart 8, pero no hay medición todavía.
 - **Memoria**: el proceso tiene ~4,4 GiB; si el juego se cuelga cargando, mirá `direct free` en las
   líneas `status:` de `boot.log`.
-- **FW 11.00**: el armado del paquete (firma, `sce_module/`) se validó en 12.02. Si no abre o da
+- **FW 13.52**: el armado del paquete (firma, `sce_module/`) se validó en 12.02. Si no abre o da
   poca memoria (`boot.log` lo reporta al inicio), es lo primero a revisar.

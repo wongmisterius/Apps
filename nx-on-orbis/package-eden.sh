@@ -10,6 +10,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 SDK="$ROOT/sdk-dl/orbis-sdk-v1/sdk"
 OO="${NXO_OO:-$ROOT/sdk-dl/PS4Toolchain}"   # OpenOrbis PS4Toolchain checkout (samples/piglet)
 export DOTNET_ROLL_FORWARD=LatestMajor
+export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1   # PkgTool.Core on hosts without ICU
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) BIN="$SDK/bin/windows"; X=.exe; mp() { cygpath -m "$1"; } ;;
   *)                    BIN="$SDK/bin/linux";   X=;     mp() { printf '%s' "$1"; } ;;

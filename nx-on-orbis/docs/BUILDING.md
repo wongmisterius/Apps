@@ -8,6 +8,7 @@ packaging tools are used:
 ```bash
 sudo apt install clang-18 lld-18 llvm-18 ninja-build glslang-tools perl make python3 git curl
 pip install "cmake>=3.31"                       # Eden needs CMake 3.31+
+# PkgTool.Core (.NET Core 3) needs OpenSSL 1.1: Ubuntu 20.04's libssl1.1 .deb installs fine on 24.04
 # SDK: orbis-sdk-v1.tar.gz unpacked as sdk-dl/orbis-sdk-v1/ (see §2, no local changes needed)
 git clone --depth 1 --filter=blob:none --sparse https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain sdk-dl/PS4Toolchain
 git -C sdk-dl/PS4Toolchain sparse-checkout set samples/piglet   # prx files for the package
