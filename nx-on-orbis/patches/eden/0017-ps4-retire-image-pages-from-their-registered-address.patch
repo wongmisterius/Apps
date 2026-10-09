@@ -1,0 +1,253 @@
+From b13770967606f0c45150463538e41d9eb693cf14 Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 18:19:17 -0300
+Subject: [PATCH 17/27] ps4: retire image pages from their registered address
+ space
+
+---
+ .../renderer_vulkan/vk_scheduler.cpp          | 14 +++--
+ .../renderer_vulkan/vk_texture_cache.cpp      |  8 +++
+ .../renderer_vulkan/vk_texture_cache.h        | 15 ++++++
+ src/video_core/texture_cache/image_base.h     |  8 +++
+ src/video_core/texture_cache/texture_cache.h  | 52 ++++++++++++++++++-
+ 5 files changed, 92 insertions(+), 5 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 596e56c..c34e0f9 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -28,7 +28,9 @@
+ #ifdef __ORBIS__
+ // A lock-free frontend breadcrumb, emitted only on a crash; no disk I/O per render pass.
+ extern "C" void EdenPs4OnRenderPass(u64 renderpass, u64 framebuffer, u64 first_image,
+-                                    u32 num_images, u64 tick) __attribute__((weak));
++                                    u32 num_images, u64 tick, u64 first_view,
++                                    u32 first_guest_format, u32 width, u32 height,
++                                    u32 samples) __attribute__((weak));
+ #endif
+ 
+ namespace Vulkan {
+@@ -122,10 +124,14 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
+     const u32 breadcrumb_images = framebuffer->NumImages();
+     const VkImage breadcrumb_image = breadcrumb_images != 0 ? framebuffer->Images()[0] : VkImage{};
+     const u64 breadcrumb_tick = CurrentTick();
++    const VkImageView breadcrumb_view = framebuffer->FirstAttachmentView();
++    const u32 breadcrumb_format = framebuffer->FirstAttachmentGuestFormat();
++    const u32 breadcrumb_samples = static_cast<u32>(framebuffer->Samples());
+ #endif
+     Record([renderpass, framebuffer_handle, render_area, values, clear_value_count
+ #ifdef __ORBIS__
+-            , breadcrumb_images, breadcrumb_image, breadcrumb_tick
++            , breadcrumb_images, breadcrumb_image, breadcrumb_tick, breadcrumb_view,
++            breadcrumb_format, breadcrumb_samples
+ #endif
+             ](vk::CommandBuffer cmdbuf) {
+         const VkRenderPassBeginInfo renderpass_bi{
+@@ -146,7 +152,9 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
+             EdenPs4OnRenderPass(reinterpret_cast<u64>(renderpass),
+                                reinterpret_cast<u64>(framebuffer_handle),
+                                reinterpret_cast<u64>(breadcrumb_image), breadcrumb_images,
+-                               breadcrumb_tick);
++                               breadcrumb_tick, reinterpret_cast<u64>(breadcrumb_view),
++                               breadcrumb_format, render_area.width, render_area.height,
++                               breadcrumb_samples);
+         }
+ #endif
+         cmdbuf.BeginRenderPass(renderpass_bi, VK_SUBPASS_CONTENTS_INLINE);
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 15dd508..3bac222 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -3675,6 +3675,10 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
+         renderpass_key.color_formats[index] = color_buffer->format;
+         num_layers = (std::max)(num_layers, color_buffer->range.extent.layers);
+         images[num_images] = color_buffer->ImageHandle();
++#ifdef __ORBIS__
++        attachment_views[num_images] = attachments.back();
++        attachment_guest_formats[num_images] = static_cast<u32>(color_buffer->format);
++#endif
+         image_ranges[num_images] = MakeSubresourceRange(color_buffer);
+         rt_map[index] = num_images;
+         samples = color_buffer->Samples();
+@@ -3692,6 +3696,10 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
+         renderpass_key.depth_format = depth_buffer->format;
+         num_layers = (std::max)(num_layers, depth_buffer->range.extent.layers);
+         images[num_images] = depth_buffer->ImageHandle();
++#ifdef __ORBIS__
++        attachment_views[num_images] = attachments.back();
++        attachment_guest_formats[num_images] = static_cast<u32>(depth_buffer->format);
++#endif
+         const VkImageSubresourceRange subresource_range = MakeSubresourceRange(depth_buffer);
+         image_ranges[num_images] = subresource_range;
+         samples = depth_buffer->Samples();
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index 68bf2af..b149767 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -246,6 +246,16 @@ public:
+         return images;
+     }
+ 
++#ifdef __ORBIS__
++    [[nodiscard]] VkImageView FirstAttachmentView() const noexcept {
++        return attachment_views[0];
++    }
++
++    [[nodiscard]] u32 FirstAttachmentGuestFormat() const noexcept {
++        return attachment_guest_formats[0];
++    }
++#endif
++
+     [[nodiscard]] const std::array<VkImageSubresourceRange, 9>& ImageRanges() const noexcept {
+         return image_ranges;
+     }
+@@ -288,6 +298,11 @@ private:
+     u32 num_color_buffers = 0;
+     u32 num_images = 0;
+     std::array<VkImage, 9> images{};
++#ifdef __ORBIS__
++    // Scalar snapshots only: never follow a driver handle when reporting a crash.
++    std::array<VkImageView, 9> attachment_views{};
++    std::array<u32, 9> attachment_guest_formats{};
++#endif
+     std::array<VkImageSubresourceRange, 9> image_ranges{};
+     std::array<size_t, NUM_RT> rt_map{};
+     bool has_depth{};
+diff --git a/src/video_core/texture_cache/image_base.h b/src/video_core/texture_cache/image_base.h
+index 79fc850..5776792 100644
+--- a/src/video_core/texture_cache/image_base.h
++++ b/src/video_core/texture_cache/image_base.h
+@@ -7,6 +7,9 @@
+ #pragma once
+ 
+ #include <array>
++#ifdef __ORBIS__
++#include <limits>
++#endif
+ #include <optional>
+ #include <vector>
+ #include <boost/container/small_vector.hpp>
+@@ -98,6 +101,11 @@ struct ImageBase {
+ 
+     size_t channel = 0;
+ 
++#ifdef __ORBIS__
++    // Stable GPU-page-table storage index captured at registration, independent of active channel.
++    size_t registered_gpu_map = (std::numeric_limits<size_t>::max)();
++#endif
++
+     ImageFlagBits flags = ImageFlagBits::CpuModified;
+ 
+     GPUVAddr gpu_addr = 0;
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 28a8836..54a9ed9 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -2167,6 +2167,17 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
+     ImageBase& image = slot_images[image_id];
+     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
+                "Trying to register an already registered image");
++#ifdef __ORBIS__
++    if (True(image.flags & ImageFlagBits::Registered)) {
++        return;
++    }
++    const auto registered_gpu_map = getStorageID(current_address_space);
++    if (!registered_gpu_map || *registered_gpu_map >= gpu_page_table_storage.size() / 2) {
++        ASSERT_MSG(false, "PS4 registering image without a valid GPU address space");
++        return;
++    }
++    image.registered_gpu_map = *registered_gpu_map;
++#endif
+     image.flags |= ImageFlagBits::Registered;
+     u64 tentative_size = (std::max)(image.guest_size_bytes, image.unswizzled_size_bytes);
+     if ((IsPixelFormatASTC(image.info.format) &&
+@@ -2178,7 +2189,11 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
+     image.lru_index = lru_cache.Insert(image_id, frame_tick);
+ 
+     ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, image_id](u64 page) {
++#ifdef __ORBIS__
++        gpu_page_table_storage[slot_images[image_id].registered_gpu_map * 2][page].push_back(image_id);
++#else
+         (*channel_state->gpu_page_table)[page].push_back(image_id);
++#endif
+     });
+     if (False(image.flags & ImageFlagBits::Sparse)) {
+         auto map_id =
+@@ -2198,7 +2213,11 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
+         });
+     sparse_views.emplace(image_id, std::move(sparse_maps));
+     ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, image_id](u64 page) {
++#ifdef __ORBIS__
++        gpu_page_table_storage[slot_images[image_id].registered_gpu_map * 2 + 1][page].push_back(image_id);
++#else
+         (*channel_state->sparse_page_table)[page].push_back(image_id);
++#endif
+     });
+ }
+ 
+@@ -2213,6 +2232,20 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
+     if (False(image.flags & ImageFlagBits::Registered)) {
+         return;
+     }
++    if (image.registered_gpu_map >= gpu_page_table_storage.size() / 2) {
++        ASSERT_MSG(false, "PS4 unregistering image without a valid GPU address-space owner");
++        return;
++    }
++    const auto active_gpu_map = getStorageID(current_address_space);
++    if (!active_gpu_map || *active_gpu_map != image.registered_gpu_map) {
++        static u32 owner_switch_logs = 0;
++        if (owner_switch_logs++ < 16) {
++            LOG_WARNING(Render_Vulkan,
++                        "PS4 texture owner: gpu={:#x} owner={} active={} (retiring owner's pages)",
++                        image.gpu_addr, image.registered_gpu_map,
++                        active_gpu_map.value_or((std::numeric_limits<size_t>::max)()));
++        }
++    }
+ #endif
+     image.flags &= ~ImageFlagBits::Registered;
+     image.flags &= ~ImageFlagBits::BadOverlap;
+@@ -2233,8 +2266,12 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
+             }
+             image_ids.erase(vector_it);
+         };
+-    ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, &clear_page_table](u64 page) {
++    ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, image_id, &clear_page_table](u64 page) {
++#ifdef __ORBIS__
++        clear_page_table(page, gpu_page_table_storage[slot_images[image_id].registered_gpu_map * 2]);
++#else
+         clear_page_table(page, (*channel_state->gpu_page_table));
++#endif
+     });
+     if (False(image.flags & ImageFlagBits::Sparse)) {
+         const auto map_id = image.map_view_id;
+@@ -2256,8 +2293,12 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
+         slot_map_views.erase(map_id);
+         return;
+     }
+-    ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, &clear_page_table](u64 page) {
++    ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, image_id, &clear_page_table](u64 page) {
++#ifdef __ORBIS__
++        clear_page_table(page, gpu_page_table_storage[slot_images[image_id].registered_gpu_map * 2 + 1]);
++#else
+         clear_page_table(page, (*channel_state->sparse_page_table));
++#endif
+     });
+     auto it = sparse_views.find(image_id);
+     ASSERT(it != sparse_views.end());
+@@ -2365,6 +2406,13 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+     }
+     ASSERT_MSG(False(image.flags & ImageFlagBits::Tracked), "Image was not untracked");
+     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");
++#ifdef __ORBIS__
++    // An invalid registration owner leaves the image registered. Preserve its live resources
++    // rather than deleting it after an unsuccessful UnregisterImage.
++    if (True(image.flags & ImageFlagBits::Registered)) {
++        return;
++    }
++#endif
+ 
+     // Do not subtract an image that failed the allocation/id checks above.
+     if (image.HasScaled()) {
+-- 
+2.56.0.windows.1
+

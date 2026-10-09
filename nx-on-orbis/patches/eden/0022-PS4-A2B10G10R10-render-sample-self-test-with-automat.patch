@@ -1,0 +1,432 @@
+From b6ceb70dae50b2489ef24cef8544317bdb71bf52 Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 13:30:00 -0300
+Subject: [PATCH 22/27] PS4: A2B10G10R10 render/sample self-test with automatic
+ view workarounds; per-frame texture-cache audit with page-level history; fix
+ SlotVector::begin distance
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/common/slot_vector.h                      |   2 +-
+ .../renderer_vulkan/vk_texture_cache.cpp      | 208 ++++++++++++++++++
+ src/video_core/texture_cache/texture_cache.h  |  93 +++++++-
+ 3 files changed, 296 insertions(+), 7 deletions(-)
+
+diff --git a/src/common/slot_vector.h b/src/common/slot_vector.h
+index f6da7a5..542b33a 100644
+--- a/src/common/slot_vector.h
++++ b/src/common/slot_vector.h
+@@ -139,7 +139,7 @@ public:
+         if (it == stored_bitset.end()) {
+             return end();
+         }
+-        const u32 word_index = static_cast<u32>(std::distance(it, stored_bitset.begin()));
++        const u32 word_index = static_cast<u32>(std::distance(stored_bitset.begin(), it));
+         const SlotId first_id{word_index * 64 + static_cast<u32>(std::countr_zero(*it))};
+         return Iterator(this, first_id);
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 713fd5b..34f1260 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -68,6 +68,14 @@ bool ps4_bgra_swap = false;
+ int ps4_rg_mode = 0;
+ // Sampled R8G8 views get red and green swapped in the component mapping.
+ bool ps4_rg_swap = false;
++// MK8D renders its videos (YUV->RGB) and 3D scenes into A2B10G10R10 targets; those are what came
++// out with red and blue swapped. Startup self-test decides, per path, whether this driver needs
++// A2B10G10R10 views replaced by A2R10G10B10 ones (the same bits, red and blue fields swapped), or
++// red/blue swapped in the sampled mapping. 0 = self-test, 2 = never (settings.txt a2b10=off).
++int ps4_a2b10_mode = 0;
++bool ps4_a2b10_rt_use_a2r10 = false;
++bool ps4_a2b10_sample_use_a2r10 = false;
++bool ps4_a2b10_sample_swap = false;
+ // Component mappings, measured at startup (Ps4SwizzleSelfTest): for each permutation of R,G,B,A
+ // that a guest view asks for on an 8-bit RGBA image, the mapping to hand the driver instead so
+ // that it samples what was asked. Empty when the driver applies every permutation correctly.
+@@ -1297,6 +1305,183 @@ bool Ps4RgSelfTest(const Device& device, MemoryAllocator& allocator) {
+     return swaps;
+ }
+ 
++/// Red through the 10-bit formats: uploads the raw word 0xC00003FF (A2B10G10R10: red=1023, alpha=3)
++/// to an A2B10G10R10 and an A2R10G10B10 image and blits each to A8B8G8R8 (sampling), and blits an
++/// A8B8G8R8 red texel into one of each (rendering). Reads all back and decides the workarounds.
++void Ps4A2b10SelfTest(const Device& device, MemoryAllocator& allocator) {
++    constexpr u32 SIZE = 4;
++    constexpr VkDeviceSize BYTES = SIZE * SIZE * 4;
++    constexpr VkFormat A2B = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
++    constexpr VkFormat A2R = VK_FORMAT_A2R10G10B10_UNORM_PACK32;
++    constexpr VkFormat RGBA = VK_FORMAT_A8B8G8R8_UNORM_PACK32;
++    const auto make_image = [&](VkFormat format) {
++        return allocator.CreateImage(VkImageCreateInfo{
++            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++            .pNext = nullptr,
++            .flags = 0,
++            .imageType = VK_IMAGE_TYPE_2D,
++            .format = format,
++            .extent = {SIZE, SIZE, 1},
++            .mipLevels = 1,
++            .arrayLayers = 1,
++            .samples = VK_SAMPLE_COUNT_1_BIT,
++            .tiling = VK_IMAGE_TILING_OPTIMAL,
++            .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
++            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++            .queueFamilyIndexCount = 0,
++            .pQueueFamilyIndices = nullptr,
++            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++        });
++    };
++    const auto make_buffer = [&](VkDeviceSize size, MemoryUsage usage) {
++        return allocator.CreateBuffer(
++            VkBufferCreateInfo{
++                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++                .pNext = nullptr,
++                .flags = 0,
++                .size = size,
++                .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++                .queueFamilyIndexCount = 0,
++                .pQueueFamilyIndices = nullptr,
++            },
++            usage);
++    };
++    // Sources: [0] A2B raw red word, [1] A2R same raw word, [2] RGBA red.
++    vk::Image a2b_src = make_image(A2B);
++    vk::Image a2r_src = make_image(A2R);
++    vk::Image rgba_src = make_image(RGBA);
++    // Destinations: sampled A2B -> RGBA, sampled A2R -> RGBA, rendered RGBA -> A2B, -> A2R.
++    vk::Image from_a2b = make_image(RGBA);
++    vk::Image from_a2r = make_image(RGBA);
++    vk::Image to_a2b = make_image(A2B);
++    vk::Image to_a2r = make_image(A2R);
++    vk::Buffer upload = make_buffer(BYTES * 2, MemoryUsage::Upload);
++    vk::Buffer download = make_buffer(BYTES * 4, MemoryUsage::Download);
++    {
++        auto bytes = upload.Mapped();
++        for (u32 i = 0; i < SIZE * SIZE; ++i) {
++            const u32 raw = 0xC00003FFu;
++            std::memcpy(bytes.data() + i * 4, &raw, 4);
++            const u8 red[4]{0xFF, 0x00, 0x00, 0xFF};
++            std::memcpy(bytes.data() + BYTES + i * 4, red, 4);
++        }
++        upload.Flush();
++    }
++    const VkImage images[7]{*a2b_src, *a2r_src, *rgba_src, *from_a2b, *from_a2r, *to_a2b, *to_a2r};
++    const VkBuffer upload_handle = *upload;
++    const VkBuffer download_handle = *download;
++    const bool done = Ps4RunOnce(device, [&](vk::CommandBuffer cmdbuf) {
++        const auto barrier = [](VkImage image, VkImageLayout from, VkImageLayout to) {
++            return VkImageMemoryBarrier{
++                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++                .pNext = nullptr,
++                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
++                .oldLayout = from,
++                .newLayout = to,
++                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .image = image,
++                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
++            };
++        };
++        constexpr auto UNDEF = VK_IMAGE_LAYOUT_UNDEFINED;
++        constexpr auto DST = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++        constexpr auto SRC = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++        std::array<VkImageMemoryBarrier, 7> all_dst{};
++        for (int i = 0; i < 7; ++i) {
++            all_dst[i] = barrier(images[i], UNDEF, DST);
++        }
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
++                               nullptr, nullptr, all_dst);
++        VkBufferImageCopy region{
++            .bufferOffset = 0,
++            .bufferRowLength = 0,
++            .bufferImageHeight = 0,
++            .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++            .imageOffset = {0, 0, 0},
++            .imageExtent = {SIZE, SIZE, 1},
++        };
++        cmdbuf.CopyBufferToImage(upload_handle, images[0], DST, region);
++        cmdbuf.CopyBufferToImage(upload_handle, images[1], DST, region);
++        region.bufferOffset = BYTES;
++        cmdbuf.CopyBufferToImage(upload_handle, images[2], DST, region);
++        const std::array srcs{barrier(images[0], DST, SRC), barrier(images[1], DST, SRC),
++                              barrier(images[2], DST, SRC)};
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
++                               nullptr, nullptr, srcs);
++        const VkImageBlit blit{
++            .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++            .srcOffsets = {{0, 0, 0}, {s32(SIZE), s32(SIZE), 1}},
++            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++            .dstOffsets = {{0, 0, 0}, {s32(SIZE), s32(SIZE), 1}},
++        };
++        cmdbuf.BlitImage(images[0], SRC, images[3], DST, blit, VK_FILTER_NEAREST);
++        cmdbuf.BlitImage(images[1], SRC, images[4], DST, blit, VK_FILTER_NEAREST);
++        cmdbuf.BlitImage(images[2], SRC, images[5], DST, blit, VK_FILTER_NEAREST);
++        cmdbuf.BlitImage(images[2], SRC, images[6], DST, blit, VK_FILTER_NEAREST);
++        const std::array dsts{barrier(images[3], DST, SRC), barrier(images[4], DST, SRC),
++                              barrier(images[5], DST, SRC), barrier(images[6], DST, SRC)};
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
++                               nullptr, nullptr, dsts);
++        for (int i = 0; i < 4; ++i) {
++            region.bufferOffset = BYTES * i;
++            cmdbuf.CopyImageToBuffer(images[3 + i], SRC, download_handle, region);
++        }
++        const VkMemoryBarrier to_host{
++            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
++        };
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
++                               to_host);
++    });
++    if (!done) {
++        LOG_ERROR(Render_Vulkan, "PS4 A2B10G10R10 self-test: the submission did not complete");
++        return;
++    }
++    download.Invalidate();
++    const auto bytes = download.Mapped();
++    const u8* a2b_sampled = bytes.data();             // RGBA bytes
++    const u8* a2r_sampled = bytes.data() + BYTES;     // RGBA bytes
++    u32 a2b_rendered = 0;
++    u32 a2r_rendered = 0;
++    std::memcpy(&a2b_rendered, bytes.data() + BYTES * 2, 4);
++    std::memcpy(&a2r_rendered, bytes.data() + BYTES * 3, 4);
++    const auto is_red = [](const u8* p) { return p[0] >= 0xF0 && p[1] < 0x10 && p[2] < 0x10; };
++    const auto is_blue = [](const u8* p) { return p[2] >= 0xF0 && p[1] < 0x10 && p[0] < 0x10; };
++    // Raw 0xC00003FF is red in A2B10G10R10 and blue in A2R10G10B10.
++    const bool a2b_sample_ok = is_red(a2b_sampled);
++    const bool a2r_sample_reads_red = is_red(a2r_sampled); // A2R doing what A2B should
++    const bool a2b_render_ok = (a2b_rendered & 0x3FFFFFFFu) == 0x3FFu;
++    const bool a2r_render_writes_low = (a2r_rendered & 0x3FFFFFFFu) == 0x3FFu;
++    LOG_WARNING(Render_Vulkan,
++                "PS4 A2B10G10R10 self-test: sample A2B raw C00003FF -> {:02x} {:02x} {:02x} {:02x} "
++                "(ok red ff 00 00), sample A2R same -> {:02x} {:02x} {:02x} {:02x} (ok blue 00 00 ff), "
++                "render red into A2B -> {:08x} (ok c00003ff), into A2R -> {:08x} (ok fff00000)",
++                a2b_sampled[0], a2b_sampled[1], a2b_sampled[2], a2b_sampled[3], a2r_sampled[0],
++                a2r_sampled[1], a2r_sampled[2], a2r_sampled[3], a2b_rendered, a2r_rendered);
++    if (!a2b_sample_ok) {
++        if (a2r_sample_reads_red) {
++            ps4_a2b10_sample_use_a2r10 = true;
++        } else if (is_blue(a2b_sampled)) {
++            ps4_a2b10_sample_swap = true;
++        }
++    }
++    if (!a2b_render_ok && a2r_render_writes_low) {
++        ps4_a2b10_rt_use_a2r10 = true;
++    }
++    LOG_WARNING(Render_Vulkan,
++                "PS4 A2B10G10R10 workaround: sampled views {}, render targets {}",
++                ps4_a2b10_sample_use_a2r10 ? "as A2R10G10B10"
++                : ps4_a2b10_sample_swap    ? "with red/blue swapped"
++                                           : "unchanged",
++                ps4_a2b10_rt_use_a2r10 ? "as A2R10G10B10" : "unchanged");
++}
++
+ /// Samples one known RGBA8 texel (11 22 33 44) through all 24 permutations of R,G,B,A as
+ /// VkComponentMapping, plus a few other mappings and a B8G8R8A8 image, with a compute shader,
+ /// and compares against what Vulkan defines. MK8D's videos read their frames with (G,B,A,R) and
+@@ -1699,6 +1884,9 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
+         ps4_rg_swap = ps4_rg_mode == 1 || rg_swaps;
+         LOG_WARNING(Render_Vulkan, "PS4 R8G8 workaround {} (mode {})", ps4_rg_swap ? "ON" : "off",
+                     ps4_rg_mode);
++        if (ps4_a2b10_mode == 0) {
++            Ps4A2b10SelfTest(device, memory_allocator);
++        }
+         if (ps4_swizzle_mode == 0) {
+             Ps4SwizzleSelfTest(device, memory_allocator);
+         }
+@@ -1721,6 +1909,15 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
+             }
+         }
+     }
++#ifdef __ORBIS__
++    if (ps4_a2b10_rt_use_a2r10 || ps4_a2b10_sample_use_a2r10) {
++        // The A2B10G10R10 workaround views those images as A2R10G10B10 (see ImageView).
++        auto& list = view_formats[static_cast<size_t>(PixelFormat::A2B10G10R10_UNORM)];
++        if (std::find(list.begin(), list.end(), VK_FORMAT_A2R10G10B10_UNORM_PACK32) == list.end()) {
++            list.push_back(VK_FORMAT_A2R10G10B10_UNORM_PACK32);
++        }
++    }
++#endif
+ 
+     if (Settings::values.gpu_unswizzle_enabled.GetValue()) {
+         bl3d_unswizzle_pass.emplace(device, scheduler, descriptor_pool,
+@@ -3295,6 +3492,17 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
+          format_info.format == VK_FORMAT_R8G8_UINT || format_info.format == VK_FORMAT_R8G8_SINT)) {
+         std::ranges::transform(swizzle, swizzle.begin(), SwapGreenRed);
+     }
++    if (format_info.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
++        if (info.IsRenderTarget()) {
++            if (ps4_a2b10_rt_use_a2r10) {
++                format_info.format = VK_FORMAT_A2R10G10B10_UNORM_PACK32;
++            }
++        } else if (ps4_a2b10_sample_use_a2r10) {
++            format_info.format = VK_FORMAT_A2R10G10B10_UNORM_PACK32;
++        } else if (ps4_a2b10_sample_swap) {
++            std::ranges::transform(swizzle, swizzle.begin(), SwapBlueRed);
++        }
++    }
+ #endif
+     if (device->ApiVersion() >= VK_API_VERSION_1_3) {
+         const VkFormatProperties3 properties3 =
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 98f6ed9..7aef648 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -53,11 +53,11 @@ struct Event {
+     u64 caller;
+     u64 tick;
+ };
+-inline Event ring[4096];
++inline Event ring[16384];
+ inline u32 next = 0;
+ inline u32 dumps = 0;
+ inline void Record(const char* op, u32 id, u64 gpu, u64 cpu, u64 size, u64 caller, u64 tick) {
+-    ring[next++ % 4096] = {op, id, gpu, cpu, size, u64(pthread_self()), caller, tick};
++    ring[next++ % 16384] = {op, id, gpu, cpu, size, u64(pthread_self()), caller, tick};
+ }
+ template <typename LogFn>
+ inline void Dump(u32 id, LogFn&& log) {
+@@ -65,14 +65,26 @@ inline void Dump(u32 id, LogFn&& log) {
+         return;
+     }
+     ++dumps;
+-    const u32 count = next < 4096 ? next : 4096;
++    const u32 count = next < 16384 ? next : 16384;
+     for (u32 i = 0; i < count; ++i) {
+-        const Event& e = ring[(next - count + i) % 4096];
++        const Event& e = ring[(next - count + i) % 16384];
+         if (e.op != nullptr && e.id == id) {
+             log(e);
+         }
+     }
+ }
++/// The last `count` events of every image, oldest first.
++template <typename LogFn>
++inline void DumpRecent(u32 count, LogFn&& log) {
++    count = (std::min)(count, (std::min)(next, 16384u));
++    for (u32 i = 0; i < count; ++i) {
++        const Event& e = ring[(next - count + i) % 16384];
++        if (e.op != nullptr) {
++            log(e);
++        }
++    }
++}
++inline u32 audit_failures = 0;
+ } // namespace VideoCommon::Ps4History
+ #endif
+ 
+@@ -219,6 +231,61 @@ void TextureCache<P>::RunGarbageCollector() {
+ 
+ template <class P>
+ void TextureCache<P>::TickFrame() {
++#ifdef __ORBIS__
++    // Audit (eden-ps4): every registered, non-sparse image must be in each of its GPU pages and
++    // its map view in each CPU page. The first times one is not, log it with the recent history
++    // of every image, to find the operation that removed it (MK8D: entries vanish between frames
++    // without an unregister of their own).
++    if (Ps4History::audit_failures < 3) {
++        for (auto it = slot_images.begin(); it != slot_images.end(); ++it) {
++            const auto [id, image] = *it;
++            if (False(image->flags & ImageFlagBits::Registered) ||
++                True(image->flags & ImageFlagBits::Sparse) ||
++                image->registered_gpu_map >= gpu_page_table_storage.size() / 2) {
++                continue;
++            }
++            const char* missing = nullptr;
++            u64 missing_page = 0;
++            auto& gpu_table = gpu_page_table_storage[image->registered_gpu_map * 2];
++            ForEachGPUPage(image->gpu_addr, image->guest_size_bytes, [&](u64 page) {
++                const auto found = gpu_table.find(page);
++                if (!missing && (found == gpu_table.end() ||
++                                 std::ranges::find(found->second, id) == found->second.end())) {
++                    missing = "GPU";
++                    missing_page = page << YUZU_PAGEBITS;
++                }
++            });
++            const ImageMapId map_id = image->map_view_id;
++            ForEachCPUPage(image->cpu_addr, image->guest_size_bytes, [&](u64 page) {
++                const auto found = page_table.find(page);
++                if (!missing && (found == page_table.end() ||
++                                 std::ranges::find(found->second, map_id) == found->second.end())) {
++                    missing = "CPU";
++                    missing_page = page << YUZU_PAGEBITS;
++                }
++            });
++            if (!missing) {
++                continue;
++            }
++            ++Ps4History::audit_failures;
++            LOG_WARNING(Render_Vulkan,
++                        "PS4 audit tick={}: registered image id={} gpu={:#x} cpu={:#x} size={:#x} "
++                        "flags={:#x} map={} owner={} is missing from its {} page {:#x}",
++                        frame_tick, id.index, image->gpu_addr, image->cpu_addr,
++                        image->guest_size_bytes, u32(image->flags), map_id.index,
++                        image->registered_gpu_map, missing, missing_page);
++            Ps4History::DumpRecent(400, [](const Ps4History::Event& e) {
++                LOG_WARNING(Render_Vulkan,
++                            "PS4 recent {} id={} a={:#x} b={:#x} size={:#x} thread={} "
++                            "caller=eboot+{:#x} tick={}",
++                            e.op, e.id, e.gpu, e.cpu, e.size,
++                            EdenPs4ThreadName ? EdenPs4ThreadName(e.thread) : "?",
++                            e.caller ? e.caller - 0x400000 : 0, e.tick);
++            });
++            break;
++        }
++    }
++#endif
+     // If we can obtain the memory info, use it instead of the estimate.
+     if (runtime.CanReportMemoryUsage()) {
+         total_used_memory = runtime.GetDeviceMemoryUsage();
+@@ -2247,6 +2314,8 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
+     ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, image_id](u64 page) {
+ #ifdef __ORBIS__
+         gpu_page_table_storage[slot_images[image_id].registered_gpu_map * 2][page].push_back(image_id);
++        Ps4History::Record("gpu_page+", image_id.index, page << YUZU_PAGEBITS,
++                           slot_images[image_id].registered_gpu_map, 0, 0, frame_tick);
+ #else
+         (*channel_state->gpu_page_table)[page].push_back(image_id);
+ #endif
+@@ -2254,8 +2323,13 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
+     if (False(image.flags & ImageFlagBits::Sparse)) {
+         auto map_id =
+             slot_map_views.insert(image.gpu_addr, image.cpu_addr, image.guest_size_bytes, image_id);
+-        ForEachCPUPage(image.cpu_addr, image.guest_size_bytes,
+-                       [this, map_id](u64 page) { page_table[page].push_back(map_id); });
++        ForEachCPUPage(image.cpu_addr, image.guest_size_bytes, [this, map_id, image_id](u64 page) {
++            page_table[page].push_back(map_id);
++#ifdef __ORBIS__
++            Ps4History::Record("cpu_page+", image_id.index, page << YUZU_PAGEBITS, map_id.index, 0,
++                               0, frame_tick);
++#endif
++        });
+         image.map_view_id = map_id;
+         return;
+     }
+@@ -2349,6 +2423,9 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
+                 return;
+             }
+             image_ids.erase(vector_it);
++#ifdef __ORBIS__
++            Ps4History::Record("gpu_page-", image_id.index, page << YUZU_PAGEBITS, 0, 0, 0, 0);
++#endif
+         };
+     ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, image_id, &clear_page_table](u64 page) {
+ #ifdef __ORBIS__
+@@ -2377,6 +2454,10 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
+                 return;
+             }
+             image_map_ids.erase(vector_it);
++#ifdef __ORBIS__
++            Ps4History::Record("cpu_page-", slot_map_views[map_id].image_id.index,
++                               page << YUZU_PAGEBITS, map_id.index, 0, 0, 0);
++#endif
+         });
+         slot_map_views.erase(map_id);
+         return;
+-- 
+2.56.0.windows.1
+

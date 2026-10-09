@@ -1,0 +1,53 @@
+From c56e508a0a863148e552e5af4694f8c96d949ac6 Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 12:33:37 -0300
+Subject: [PATCH 21/27] PS4: name the thread in the texture-cache image history
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/video_core/texture_cache/texture_cache.h | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index d647bad..98f6ed9 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -39,6 +39,7 @@ extern "C" void EdenPs4Backtrace(const char* why, unsigned long long a, unsigned
+         }                                                                                         \
+     } while (0)
+ #include <pthread.h>
++extern "C" const char* EdenPs4ThreadName(unsigned long long thread) __attribute__((weak));
+ namespace VideoCommon::Ps4History {
+ // Last texture-cache events per image (register / unregister / delete), with thread and caller,
+ // dumped for an image the first times it is found inconsistent. Under the cache mutex.
+@@ -2289,9 +2290,11 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
+                      image.gpu_addr, image.cpu_addr, image.guest_size_bytes);
+         Ps4History::Dump(image_id.index, [](const Ps4History::Event& e) {
+             LOG_WARNING(Render_Vulkan,
+-                        "PS4 image history id={} {} gpu={:#x} cpu={:#x} size={:#x} thread={:#x} "
++                        "PS4 image history id={} {} gpu={:#x} cpu={:#x} size={:#x} thread={} "
+                         "caller=eboot+{:#x} tick={}",
+-                        e.id, e.op, e.gpu, e.cpu, e.size, e.thread, e.caller - 0x400000, e.tick);
++                        e.id, e.op, e.gpu, e.cpu, e.size,
++                        EdenPs4ThreadName ? EdenPs4ThreadName(e.thread) : "?",
++                        e.caller - 0x400000, e.tick);
+         });
+         return;
+     }
+@@ -2336,9 +2339,11 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
+                              image_id.index, page << YUZU_PAGEBITS, image_ids.size(), 0);
+                 Ps4History::Dump(image_id.index, [](const Ps4History::Event& e) {
+                     LOG_WARNING(Render_Vulkan,
+-                                "PS4 image history id={} {} gpu={:#x} cpu={:#x} size={:#x} thread={:#x} "
++                                "PS4 image history id={} {} gpu={:#x} cpu={:#x} size={:#x} thread={} "
+                                 "caller=eboot+{:#x} tick={}",
+-                                e.id, e.op, e.gpu, e.cpu, e.size, e.thread, e.caller - 0x400000, e.tick);
++                                e.id, e.op, e.gpu, e.cpu, e.size,
++                                EdenPs4ThreadName ? EdenPs4ThreadName(e.thread) : "?",
++                                e.caller - 0x400000, e.tick);
+                 });
+ #endif
+                 return;
+-- 
+2.56.0.windows.1
+

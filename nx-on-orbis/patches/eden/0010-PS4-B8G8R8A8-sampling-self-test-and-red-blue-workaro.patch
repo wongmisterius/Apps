@@ -1,0 +1,251 @@
+From f1acd2b104f932213f8cbe55243361eaa16c242d Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 02:20:12 -0300
+Subject: [PATCH 10/27] PS4: B8G8R8A8 sampling self-test and red/blue
+ workaround, guard double image unregistration
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/common/lru_cache.h                        |   6 +
+ .../renderer_vulkan/vk_texture_cache.cpp      | 168 ++++++++++++++++++
+ src/video_core/texture_cache/texture_cache.h  |   7 +
+ 3 files changed, 181 insertions(+)
+
+diff --git a/src/common/lru_cache.h b/src/common/lru_cache.h
+index 952ba0e..331ffec 100644
+--- a/src/common/lru_cache.h
++++ b/src/common/lru_cache.h
+@@ -54,6 +54,12 @@ public:
+ 
+     void Free(size_t id) {
+         auto& item = item_pool[id];
++#ifdef __ORBIS__
++        // A slot already freed would be queued twice and later handed to two owners.
++        if (!item.prev && !item.next && &item != first_item) {
++            return;
++        }
++#endif
+         Detach(item);
+         item.prev = nullptr;
+         item.next = nullptr;
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index c3f5640..dd665f1 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -39,6 +39,14 @@
+ 
+ namespace Vulkan {
+ 
++#ifdef __ORBIS__
++// PS4 RADV: B8G8R8A8 textures were sampled with red and blue swapped (MK8D videos and characters).
++// 0 = decide by the startup self-test, 1 = always work around, 2 = never (set by the frontend).
++int ps4_bgra_mode = 0;
++// Sampled B8G8R8A8 views become A8B8G8R8 views with red and blue swapped in the component mapping.
++bool ps4_bgra_swap = false;
++#endif
++
+ using Tegra::Engines::Fermi2D;
+ using Tegra::Texture::SwizzleSource;
+ using Tegra::Texture::TextureMipmapFilter;
+@@ -930,6 +938,145 @@ void BlitScale(Scheduler& scheduler, VkImage src_image, VkImage dst_image, const
+                        0, nullptr, nullptr, write_barriers);
+     });
+ }
++
++#ifdef __ORBIS__
++/// Uploads one known pixel to a B8G8R8A8 and an A8B8G8R8 image, blits each into the other format
++/// (the blit samples the source and renders the destination) and reads all of them back, to see
++/// whether this driver swaps red and blue on B8G8R8A8 images. Returns true if sampling one does.
++bool Ps4BgraSelfTest(const Device& device, Scheduler& scheduler, MemoryAllocator& allocator) {
++    constexpr u32 SIZE = 4;
++    constexpr VkDeviceSize IMAGE_BYTES = SIZE * SIZE * 4;
++    const auto make_image = [&](VkFormat format) {
++        return allocator.CreateImage(VkImageCreateInfo{
++            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++            .pNext = nullptr,
++            .flags = 0,
++            .imageType = VK_IMAGE_TYPE_2D,
++            .format = format,
++            .extent = {SIZE, SIZE, 1},
++            .mipLevels = 1,
++            .arrayLayers = 1,
++            .samples = VK_SAMPLE_COUNT_1_BIT,
++            .tiling = VK_IMAGE_TILING_OPTIMAL,
++            .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
++            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++            .queueFamilyIndexCount = 0,
++            .pQueueFamilyIndices = nullptr,
++            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++        });
++    };
++    const auto make_buffer = [&](MemoryUsage usage) {
++        return allocator.CreateBuffer(
++            VkBufferCreateInfo{
++                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++                .pNext = nullptr,
++                .flags = 0,
++                .size = IMAGE_BYTES * 3,
++                .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++                .queueFamilyIndexCount = 0,
++                .pQueueFamilyIndices = nullptr,
++            },
++            usage);
++    };
++    vk::Image bgra_src = make_image(VK_FORMAT_B8G8R8A8_UNORM);
++    vk::Image rgba_src = make_image(VK_FORMAT_A8B8G8R8_UNORM_PACK32);
++    vk::Image bgra_dst = make_image(VK_FORMAT_B8G8R8A8_UNORM);
++    vk::Image rgba_dst = make_image(VK_FORMAT_A8B8G8R8_UNORM_PACK32);
++    vk::Buffer upload = make_buffer(MemoryUsage::Upload);
++    vk::Buffer download = make_buffer(MemoryUsage::Download);
++
++    static constexpr u8 PIXEL[4]{0x11, 0x22, 0x33, 0x44};
++    auto upload_bytes = upload.Mapped();
++    for (size_t i = 0; i < IMAGE_BYTES; ++i) {
++        upload_bytes[i] = PIXEL[i % 4];
++    }
++    upload.Flush();
++
++    scheduler.RequestOutsideRenderPassOperationContext();
++    scheduler.Record([bgra_src = *bgra_src, rgba_src = *rgba_src, bgra_dst = *bgra_dst,
++                      rgba_dst = *rgba_dst, upload = *upload,
++                      download = *download](vk::CommandBuffer cmdbuf) {
++        const auto barrier = [](VkImage image, VkImageLayout from, VkImageLayout to) {
++            return VkImageMemoryBarrier{
++                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++                .pNext = nullptr,
++                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
++                .oldLayout = from,
++                .newLayout = to,
++                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .image = image,
++                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
++            };
++        };
++        const VkBufferImageCopy region{
++            .bufferOffset = 0,
++            .bufferRowLength = 0,
++            .bufferImageHeight = 0,
++            .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++            .imageOffset = {0, 0, 0},
++            .imageExtent = {SIZE, SIZE, 1},
++        };
++        const VkImageBlit blit{
++            .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++            .srcOffsets = {{0, 0, 0}, {s32(SIZE), s32(SIZE), 1}},
++            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++            .dstOffsets = {{0, 0, 0}, {s32(SIZE), s32(SIZE), 1}},
++        };
++        constexpr auto UNDEF = VK_IMAGE_LAYOUT_UNDEFINED;
++        constexpr auto DST = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++        constexpr auto SRC = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++        const std::array to_dst{barrier(bgra_src, UNDEF, DST), barrier(rgba_src, UNDEF, DST),
++                                barrier(bgra_dst, UNDEF, DST), barrier(rgba_dst, UNDEF, DST)};
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
++                               nullptr, nullptr, to_dst);
++        cmdbuf.CopyBufferToImage(upload, bgra_src, DST, region);
++        cmdbuf.CopyBufferToImage(upload, rgba_src, DST, region);
++        const std::array srcs_to_src{barrier(bgra_src, DST, SRC), barrier(rgba_src, DST, SRC)};
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
++                               nullptr, nullptr, srcs_to_src);
++        cmdbuf.BlitImage(bgra_src, SRC, rgba_dst, DST, blit, VK_FILTER_NEAREST);
++        cmdbuf.BlitImage(rgba_src, SRC, bgra_dst, DST, blit, VK_FILTER_NEAREST);
++        const std::array dsts_to_src{barrier(bgra_dst, DST, SRC), barrier(rgba_dst, DST, SRC)};
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
++                               nullptr, nullptr, dsts_to_src);
++        VkBufferImageCopy out = region;
++        cmdbuf.CopyImageToBuffer(bgra_src, SRC, download, out);
++        out.bufferOffset = IMAGE_BYTES;
++        cmdbuf.CopyImageToBuffer(rgba_dst, SRC, download, out);
++        out.bufferOffset = IMAGE_BYTES * 2;
++        cmdbuf.CopyImageToBuffer(bgra_dst, SRC, download, out);
++        const VkMemoryBarrier to_host{
++            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
++        };
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
++                               to_host);
++    });
++    scheduler.Finish();
++    download.Invalidate();
++    const auto bytes = download.Mapped();
++    const auto word = [&](size_t slot) {
++        const u8* p = bytes.data() + slot * IMAGE_BYTES;
++        return u32(p[0]) | u32(p[1]) << 8 | u32(p[2]) << 16 | u32(p[3]) << 24;
++    };
++    // Bytes in memory order. The B8G8R8A8 source holds B=11 G=22 R=33; the A8B8G8R8 one R=11 B=33.
++    const u32 raw = word(0);         // expected 44332211: a plain copy keeps the bytes
++    const u32 sampled = word(1);     // B8G8R8A8 -> A8B8G8R8, expected 44112233
++    const u32 rendered = word(2);    // A8B8G8R8 -> B8G8R8A8, expected 44112233
++    const bool sample_swaps = sampled == 0x44332211;
++    LOG_WARNING(Render_Vulkan,
++                "PS4 BGRA self-test: copy {:08x} (ok 44332211), BGRA->RGBA blit {:08x} (ok 44112233), "
++                "RGBA->BGRA blit {:08x} (ok 44112233) -> sampling B8G8R8A8 {}",
++                raw, sampled, rendered, sample_swaps ? "SWAPS red/blue" : "is correct");
++    return sample_swaps;
++}
++#endif
+ } // Anonymous namespace
+ 
+ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& scheduler_,
+@@ -946,6 +1093,16 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
+         astc_decoder_pass.emplace(device, scheduler, descriptor_pool, staging_buffer_pool,
+                                   compute_pass_descriptor_queue, memory_allocator);
+     }
++#ifdef __ORBIS__
++    {
++        // The workaround views a B8G8R8A8 image as A8B8G8R8, which needs the format list.
++        const bool swaps = Ps4BgraSelfTest(device, scheduler, memory_allocator);
++        ps4_bgra_swap = device.IsKhrImageFormatListSupported() &&
++                        (ps4_bgra_mode == 1 || (ps4_bgra_mode == 0 && swaps));
++        LOG_WARNING(Render_Vulkan, "PS4 BGRA workaround {} (mode {})",
++                    ps4_bgra_swap ? "ON" : "off", ps4_bgra_mode);
++    }
++#endif
+     if (!device.IsKhrImageFormatListSupported()) {
+         return;
+     }
+@@ -2519,6 +2676,17 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
+         }
+     }
+     auto format_info = MaxwellToVK::SurfaceFormat(*device, FormatType::Optimal, true, format);
++#ifdef __ORBIS__
++    if (ps4_bgra_swap && !info.IsRenderTarget() &&
++        (format_info.format == VK_FORMAT_B8G8R8A8_UNORM ||
++         format_info.format == VK_FORMAT_B8G8R8A8_SRGB)) {
++        // Sample the same bytes as A8B8G8R8 and swap red and blue in the mapping instead.
++        format_info.format = format_info.format == VK_FORMAT_B8G8R8A8_SRGB
++                                 ? VK_FORMAT_A8B8G8R8_SRGB_PACK32
++                                 : VK_FORMAT_A8B8G8R8_UNORM_PACK32;
++        std::ranges::transform(swizzle, swizzle.begin(), SwapBlueRed);
++    }
++#endif
+     if (device->ApiVersion() >= VK_API_VERSION_1_3) {
+         const VkFormatProperties3 properties3 =
+             device->GetPhysical().GetFormatProperties3(format_info.format);
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 640bd38..85a22e3 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -2186,6 +2186,13 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
+     Image& image = slot_images[image_id];
+     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
+                "Trying to unregister an already registered image");
++#ifdef __ORBIS__
++    // Unregistering twice frees the image's LRU slot twice; two images then share it and the LRU
++    // list corrupts (MK8D crashed in LeastRecentlyUsedCache::Free). Its pages are already gone.
++    if (False(image.flags & ImageFlagBits::Registered)) {
++        return;
++    }
++#endif
+     image.flags &= ~ImageFlagBits::Registered;
+     image.flags &= ~ImageFlagBits::BadOverlap;
+     lru_cache.Free(image.lru_index);
+-- 
+2.56.0.windows.1
+

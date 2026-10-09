@@ -1,0 +1,818 @@
+From afc5fd08f987d38f2d82823ce67b8b2ae7374d3e Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 20:54:29 -0300
+Subject: [PATCH 02/27] PS4: audio sink (sceAudioOut) and lazy-committed guest
+ RAM and large tables
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/audio_core/CMakeLists.txt        |   6 +
+ src/audio_core/sink/ps4_sink.cpp     | 172 ++++++++++++++++++
+ src/audio_core/sink/ps4_sink.h       |  38 ++++
+ src/audio_core/sink/sink_details.cpp |  15 ++
+ src/common/CMakeLists.txt            |   5 +
+ src/common/host_memory.cpp           |  25 ++-
+ src/common/host_memory.h             |   2 +-
+ src/common/orbis_lazy_memory.cpp     | 259 +++++++++++++++++++++++++++
+ src/common/orbis_lazy_memory.h       |  49 +++++
+ src/common/sparse_large_vector.cpp   |  16 ++
+ src/common/sparse_large_vector.h     |  10 +-
+ 11 files changed, 588 insertions(+), 9 deletions(-)
+ create mode 100644 src/audio_core/sink/ps4_sink.cpp
+ create mode 100644 src/audio_core/sink/ps4_sink.h
+ create mode 100644 src/common/orbis_lazy_memory.cpp
+ create mode 100644 src/common/orbis_lazy_memory.h
+
+diff --git a/src/audio_core/CMakeLists.txt b/src/audio_core/CMakeLists.txt
+index f307e58..338aa4e 100644
+--- a/src/audio_core/CMakeLists.txt
++++ b/src/audio_core/CMakeLists.txt
+@@ -238,6 +238,12 @@ if (ENABLE_CUBEB)
+     target_compile_definitions(audio_core PRIVATE HAVE_CUBEB=1)
+ endif()
+ 
++if (PS4)
++target_sources(audio_core PRIVATE
++    sink/ps4_sink.cpp
++    sink/ps4_sink.h)
++endif()
++
+ if (NOT PS4)
+ target_sources(audio_core PRIVATE
+     sink/sdl3_sink.cpp
+diff --git a/src/audio_core/sink/ps4_sink.cpp b/src/audio_core/sink/ps4_sink.cpp
+new file mode 100644
+index 0000000..818b408
+--- /dev/null
++++ b/src/audio_core/sink/ps4_sink.cpp
+@@ -0,0 +1,172 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// PS4 (OpenOrbis) audio output: sceAudioOut, one port per stream, fed by a thread.
++//
++// sceAudioOutOutput blocks until the port has room for the next grain, so the feeding thread is
++// paced by the hardware and needs no timer of its own. Input streams (microphone) produce nothing.
++
++#include <atomic>
++#include <span>
++#include <thread>
++#include <vector>
++
++#include "audio_core/common/common.h"
++#include "audio_core/sink/ps4_sink.h"
++#include "audio_core/sink/sink_stream.h"
++#include "common/logging.h"
++#include "common/thread.h"
++#include "core/core.h"
++
++extern "C" {
++int sceAudioOutInit(void);
++int sceAudioOutOpen(int user_id, int type, int index, unsigned int len, unsigned int freq,
++                    unsigned int param);
++int sceAudioOutOutput(int handle, const void* ptr);
++int sceAudioOutClose(int handle);
++}
++
++namespace AudioCore::Sink {
++
++namespace {
++constexpr int UserIdSystem = 0xFF;      // SCE_USER_SERVICE_USER_ID_SYSTEM
++constexpr int PortTypeMain = 0;         // SCE_AUDIO_OUT_PORT_TYPE_MAIN
++constexpr unsigned ParamS16Stereo = 1;  // SCE_AUDIO_OUT_PARAM_FORMAT_S16_STEREO
++constexpr unsigned GrainFrames = 256;   // frames handed to the port per call
++
++bool InitializeAudioOut() {
++    static const int result = sceAudioOutInit();
++    // 0x8026000E: already initialised (the frontend may have done it first)
++    return result == 0 || static_cast<unsigned>(result) == 0x8026000Eu;
++}
++} // Anonymous namespace
++
++class Ps4SinkStream final : public SinkStream {
++public:
++    Ps4SinkStream(u32 device_channels_, u32 system_channels_, StreamType type_,
++                  Core::System& system_)
++        : SinkStream{system_, type_} {
++        system_channels = system_channels_;
++        device_channels = device_channels_;
++        if (type == StreamType::In) {
++            return;
++        }
++        if (!InitializeAudioOut()) {
++            LOG_CRITICAL(Audio_Sink, "sceAudioOutInit failed");
++            return;
++        }
++        handle = sceAudioOutOpen(UserIdSystem, PortTypeMain, 0, GrainFrames, TargetSampleRate,
++                                 ParamS16Stereo);
++        if (handle < 0) {
++            LOG_CRITICAL(Audio_Sink, "sceAudioOutOpen failed: {:#x}", static_cast<u32>(handle));
++            return;
++        }
++        LOG_INFO(Audio_Sink, "PS4 audio port {} opened ({} Hz, {} frames, system channels {})",
++                 handle, TargetSampleRate, GrainFrames, system_channels);
++        feeder = std::jthread([this](std::stop_token stop) { Feed(stop); });
++    }
++
++    ~Ps4SinkStream() override {
++        Finalize();
++    }
++
++    void Finalize() override {
++        Stop();
++        if (feeder.joinable()) {
++            feeder.request_stop();
++            feeder.join();
++        }
++        if (handle >= 0) {
++            sceAudioOutClose(handle);
++            handle = -1;
++        }
++    }
++
++    void Start(bool resume = false) override {
++        if (handle < 0 || !paused) {
++            return;
++        }
++        paused = false;
++    }
++
++    void Stop() override {
++        if (handle < 0 || paused) {
++            return;
++        }
++        SignalPause();
++    }
++
++private:
++    void Feed(std::stop_token stop) {
++        Common::SetCurrentThreadName("AudioOutPS4");
++        std::vector<s16> grain(GrainFrames * 2);
++        std::vector<s16> silence(GrainFrames * 2);
++        while (!stop.stop_requested()) {
++            if (paused) {
++                sceAudioOutOutput(handle, silence.data());
++                continue;
++            }
++            ProcessAudioOutAndRender(std::span<s16>{grain}, GrainFrames);
++            sceAudioOutOutput(handle, grain.data());
++        }
++        sceAudioOutOutput(handle, nullptr); // wait for the last grain
++    }
++
++    int handle{-1};
++    std::jthread feeder;
++};
++
++Ps4Sink::Ps4Sink(std::string_view) {
++    device_channels = 2;
++}
++
++Ps4Sink::~Ps4Sink() = default;
++
++SinkStream* Ps4Sink::AcquireSinkStream(Core::System& system, u32 system_channels_,
++                                       const std::string&, StreamType type) {
++    system_channels = system_channels_;
++    SinkStreamPtr& stream = sink_streams.emplace_back(
++        std::make_unique<Ps4SinkStream>(device_channels, system_channels, type, system));
++    return stream.get();
++}
++
++void Ps4Sink::CloseStream(SinkStream* stream) {
++    for (size_t i = 0; i < sink_streams.size(); i++) {
++        if (sink_streams[i].get() == stream) {
++            sink_streams[i].reset();
++            sink_streams.erase(sink_streams.begin() + i);
++            break;
++        }
++    }
++}
++
++void Ps4Sink::CloseStreams() {
++    sink_streams.clear();
++}
++
++f32 Ps4Sink::GetDeviceVolume() const {
++    return sink_streams.empty() ? 1.0f : sink_streams[0]->GetDeviceVolume();
++}
++
++void Ps4Sink::SetDeviceVolume(f32 volume) {
++    for (auto& stream : sink_streams) {
++        stream->SetDeviceVolume(volume);
++    }
++}
++
++void Ps4Sink::SetSystemVolume(f32 volume) {
++    for (auto& stream : sink_streams) {
++        stream->SetSystemVolume(volume);
++    }
++}
++
++std::vector<std::string> ListPs4SinkDevices(bool capture) {
++    if (capture) {
++        return {};
++    }
++    return {"PS4 audio out"};
++}
++
++u32 GetPs4Latency() {
++    return GrainFrames * 2;
++}
++
++} // namespace AudioCore::Sink
+diff --git a/src/audio_core/sink/ps4_sink.h b/src/audio_core/sink/ps4_sink.h
+new file mode 100644
+index 0000000..203f791
+--- /dev/null
++++ b/src/audio_core/sink/ps4_sink.h
+@@ -0,0 +1,38 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// PS4 (OpenOrbis) audio output: sceAudioOut, one port per stream, fed by a thread.
++
++#pragma once
++
++#include <string>
++#include <vector>
++
++#include "audio_core/sink/sink.h"
++
++namespace Core {
++class System;
++}
++
++namespace AudioCore::Sink {
++class SinkStream;
++
++class Ps4Sink final : public Sink {
++public:
++    explicit Ps4Sink(std::string_view device_id);
++    ~Ps4Sink() override;
++
++    SinkStream* AcquireSinkStream(Core::System& system, u32 system_channels,
++                                  const std::string& name, StreamType type) override;
++    void CloseStream(SinkStream* stream) override;
++    void CloseStreams() override;
++    f32 GetDeviceVolume() const override;
++    void SetDeviceVolume(f32 volume) override;
++    void SetSystemVolume(f32 volume) override;
++
++private:
++    std::vector<SinkStreamPtr> sink_streams;
++};
++
++std::vector<std::string> ListPs4SinkDevices(bool capture);
++u32 GetPs4Latency();
++
++} // namespace AudioCore::Sink
+diff --git a/src/audio_core/sink/sink_details.cpp b/src/audio_core/sink/sink_details.cpp
+index efd8fce..a74f3cd 100644
+--- a/src/audio_core/sink/sink_details.cpp
++++ b/src/audio_core/sink/sink_details.cpp
+@@ -16,6 +16,9 @@
+ #ifdef HAVE_SDL3
+ #include "audio_core/sink/sdl3_sink.h"
+ #endif
++#ifdef __ORBIS__
++#include "audio_core/sink/ps4_sink.h"
++#endif
+ #include "audio_core/sink/null_sink.h"
+ #include "common/logging.h"
+ #include "common/settings_enums.h"
+@@ -42,6 +45,18 @@ struct SinkDetails {
+ 
+ // sink_details is ordered in terms of desirability, with the best choice at the top.
+ constexpr SinkDetails sink_details[] = {
++#ifdef __ORBIS__
++    // PS4: sceAudioOut, in the slot SDL3 has elsewhere (there is no SDL on the console). First
++    // in the list, so "auto" picks it.
++    SinkDetails{
++        Settings::AudioEngine::Sdl3,
++        [](std::string_view device_id) -> std::unique_ptr<Sink> {
++            return std::make_unique<Ps4Sink>(device_id);
++        },
++        &ListPs4SinkDevices,
++        &GetPs4Latency,
++    },
++#endif
+ #ifdef HAVE_CUBEB
+     SinkDetails{
+         Settings::AudioEngine::Cubeb,
+diff --git a/src/common/CMakeLists.txt b/src/common/CMakeLists.txt
+index 61e0e64..defdfa7 100644
+--- a/src/common/CMakeLists.txt
++++ b/src/common/CMakeLists.txt
+@@ -255,3 +255,8 @@ if(ANDROID)
+ endif()
+ 
+ create_target_directory_groups(common)
++
++if (PS4)
++    # PS4: reserve-and-commit-on-touch memory for the guest RAM and the large tables
++    target_sources(common PRIVATE orbis_lazy_memory.cpp orbis_lazy_memory.h)
++endif()
+diff --git a/src/common/host_memory.cpp b/src/common/host_memory.cpp
+index 75a9da8..2630c40 100644
+--- a/src/common/host_memory.cpp
++++ b/src/common/host_memory.cpp
+@@ -58,6 +58,9 @@
+ #include "common/assert.h"
+ #include "common/free_region_manager.h"
+ #include "common/host_memory.h"
++#ifdef __ORBIS__
++#include "common/orbis_lazy_memory.h"
++#endif
+ #include "common/logging.h"
+ 
+ #if defined(__ANDROID__) && __ANDROID_API__ < 30
+@@ -401,7 +404,7 @@ private:
+     ::Common::unordered_map<size_t, size_t> placeholder_host_pointers; ///< Placeholder backing offset
+ };
+ 
+-#elif defined(__OPENORBIS__) || defined(__managarm__)
++#elif defined(__OPENORBIS__) || defined(__managarm__) || defined(__ORBIS__)
+ // None of the luxuries of POSIX, all of the suffering
+ // For managarm: see https://github.com/managarm/managarm/issues/1370
+ #else // ^^^ Windows ^^^ vvv POSIX vvv
+@@ -708,7 +711,12 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
+     : backing_size(backing_size_)
+     , virtual_size(virtual_size_)
+ {
+-#if defined(__OPENORBIS__) || defined(__managarm__)
++#if defined(__ORBIS__)
++    // PS4: the guest RAM is reserved and committed on first touch (common/orbis_lazy_memory).
++    backing_base = static_cast<u8*>(Common::Orbis::ReserveLazy(backing_size, "guest RAM"));
++    ASSERT_MSG(backing_base, "Failed to reserve {:#x} bytes for the guest RAM", backing_size);
++    virtual_base = nullptr;
++#elif defined(__OPENORBIS__) || defined(__managarm__)
+     LOG_WARNING(HW_Memory, "Platform doesn't support fastmem");
+     backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+     virtual_base = nullptr;
+@@ -750,7 +758,7 @@ HostMemory::HostMemory(HostMemory&&) noexcept = default;
+ HostMemory& HostMemory::operator=(HostMemory&&) noexcept = default;
+ 
+ void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms, bool separate_heap) {
+-#if !(defined(__OPENORBIS__) || defined(__managarm__))
++#if !(defined(__OPENORBIS__) || defined(__managarm__) || defined(__ORBIS__))
+     ASSERT(virtual_offset % PageAlignment == 0);
+     ASSERT(host_offset % PageAlignment == 0);
+     ASSERT(length % PageAlignment == 0);
+@@ -764,7 +772,7 @@ void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, M
+ }
+ 
+ void HostMemory::Unmap(size_t virtual_offset, size_t length, bool separate_heap) {
+-#if !(defined(__OPENORBIS__) || defined(__managarm__))
++#if !(defined(__OPENORBIS__) || defined(__managarm__) || defined(__ORBIS__))
+     ASSERT(virtual_offset % PageAlignment == 0);
+     ASSERT(length % PageAlignment == 0);
+     ASSERT(virtual_offset + length <= virtual_size);
+@@ -776,7 +784,7 @@ void HostMemory::Unmap(size_t virtual_offset, size_t length, bool separate_heap)
+ }
+ 
+ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission perm) {
+-#if !(defined(__OPENORBIS__) || defined(__managarm__))
++#if !(defined(__OPENORBIS__) || defined(__managarm__) || defined(__ORBIS__))
+     ASSERT(virtual_offset % PageAlignment == 0);
+     ASSERT(length % PageAlignment == 0);
+     ASSERT(virtual_offset + length <= virtual_size);
+@@ -791,11 +799,16 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission
+ }
+ 
+ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
++#ifdef __ORBIS__
++    // Untouched chunks are already zero and stay uncommitted.
++    Common::Orbis::FillLazy(backing_base + physical_offset, length, u8(fill_value));
++#else
+     std::memset(backing_base + physical_offset, fill_value, length);
++#endif
+ }
+ 
+ void HostMemory::EnableDirectMappedAddress() {
+-#if !(defined(__OPENORBIS__) || defined(__managarm__))
++#if !(defined(__OPENORBIS__) || defined(__managarm__) || defined(__ORBIS__))
+     if (impl) {
+         impl->EnableDirectMappedAddress();
+         virtual_size += reinterpret_cast<uintptr_t>(virtual_base);
+diff --git a/src/common/host_memory.h b/src/common/host_memory.h
+index a7fd053..1a8bfc3 100644
+--- a/src/common/host_memory.h
++++ b/src/common/host_memory.h
+@@ -76,7 +76,7 @@ private:
+     size_t backing_size{};
+     size_t virtual_size{};
+ 
+-#if !(defined(__OPENORBIS__) || defined(__managarm__))
++#if !(defined(__OPENORBIS__) || defined(__managarm__) || defined(__ORBIS__))
+     // Low level handler for the platform dependent memory routines
+     class Impl;
+     std::unique_ptr<Impl> impl;
+diff --git a/src/common/orbis_lazy_memory.cpp b/src/common/orbis_lazy_memory.cpp
+new file mode 100644
+index 0000000..2620d47
+--- /dev/null
++++ b/src/common/orbis_lazy_memory.cpp
+@@ -0,0 +1,259 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// PS4 (OpenOrbis): address ranges that get memory only where they are touched. See the header.
++//
++// Measured on the target console (eden-probe, PS4 Pro, FW 12.52): a range reserved with
++// sceKernelReserveVirtualRange takes MAP_FIXED direct-memory mappings inside it, and a fault
++// handler installed with sceKernelInstallExceptionHandler can return and have the faulting
++// access retried (about 5 us per fault).
++
++#include <atomic>
++#include <cstring>
++#include <new>
++
++#include <sys/types.h>
++
++#include "common/orbis_lazy_memory.h"
++
++extern "C" {
++int32_t sceKernelAllocateDirectMemory(off_t search_start, off_t search_end, size_t len,
++                                      size_t alignment, int32_t memory_type, off_t* phys_out);
++int32_t sceKernelMapDirectMemory(void** addr, size_t len, int32_t prot, int32_t flags,
++                                 off_t phys, size_t alignment);
++int32_t sceKernelReleaseDirectMemory(off_t phys, size_t len);
++int32_t sceKernelReserveVirtualRange(void** addr, size_t len, int32_t flags, size_t alignment);
++int32_t sceKernelMunmap(void* addr, size_t len);
++size_t sceKernelGetDirectMemorySize(void);
++int sceKernelInstallExceptionHandler(int signal, void (*handler)(int, void*));
++}
++
++namespace Common::Orbis {
++
++namespace {
++
++constexpr std::size_t Chunk = 64 * 1024;
++constexpr int32_t ProtCpuRw = 0x03;
++constexpr int32_t MapFixed = 0x0010;
++constexpr int32_t WbOnion = 0;
++constexpr int SigBus = 10;  // FreeBSD numbering, as the exception API takes them
++constexpr int SigSegv = 11;
++// PS4 ucontext: 16-byte signal mask + 48 bytes of padding, then a FreeBSD amd64 mcontext.
++constexpr std::size_t McontextOffset = 64;
++constexpr std::size_t McAddr = 136;
++
++struct Region {
++    std::uintptr_t base;
++    std::size_t size;
++    std::atomic<off_t>* phys; // one per chunk; -1 = not committed
++    const char* name;
++};
++
++constexpr int MaxRegions = 64;
++Region g_regions[MaxRegions];
++std::atomic<int> g_region_count{0};
++std::atomic_flag g_lock = ATOMIC_FLAG_INIT;
++std::atomic<FaultChain> g_next{nullptr};
++std::atomic<std::size_t> g_reserved{0};
++std::atomic<std::size_t> g_committed{0};
++std::atomic<std::size_t> g_failures{0};
++
++struct SpinGuard {
++    SpinGuard() {
++        while (g_lock.test_and_set(std::memory_order_acquire)) {
++        }
++    }
++    ~SpinGuard() {
++        g_lock.clear(std::memory_order_release);
++    }
++};
++
++Region* FindRegion(std::uintptr_t addr) {
++    const int count = g_region_count.load(std::memory_order_acquire);
++    for (int i = 0; i < count; ++i) {
++        Region& r = g_regions[i];
++        if (r.size != 0 && addr >= r.base && addr - r.base < r.size) {
++            return &r;
++        }
++    }
++    return nullptr;
++}
++
++// Caller holds g_lock.
++bool CommitChunkLocked(Region& r, std::size_t index) {
++    if (r.phys[index].load(std::memory_order_relaxed) != -1) {
++        return true;
++    }
++    off_t phys = 0;
++    if (sceKernelAllocateDirectMemory(0, static_cast<off_t>(sceKernelGetDirectMemorySize()), Chunk,
++                                      Chunk, WbOnion, &phys) != 0) {
++        g_failures.fetch_add(1, std::memory_order_relaxed);
++        return false;
++    }
++    void* at = reinterpret_cast<void*>(r.base + index * Chunk);
++    if (sceKernelMapDirectMemory(&at, Chunk, ProtCpuRw, MapFixed, phys, Chunk) != 0 ||
++        reinterpret_cast<std::uintptr_t>(at) != r.base + index * Chunk) {
++        sceKernelReleaseDirectMemory(phys, Chunk);
++        g_failures.fetch_add(1, std::memory_order_relaxed);
++        return false;
++    }
++    // Direct memory comes back with whatever the last owner left in it.
++    std::memset(at, 0, Chunk);
++    r.phys[index].store(phys, std::memory_order_release);
++    g_committed.fetch_add(Chunk, std::memory_order_relaxed);
++    return true;
++}
++
++bool CommitAddress(std::uintptr_t addr) {
++    Region* r = FindRegion(addr);
++    if (r == nullptr) {
++        return false;
++    }
++    SpinGuard guard;
++    return CommitChunkLocked(*r, (addr - r->base) / Chunk);
++}
++
++void FaultHandler(int signal, void* ucontext) {
++    const auto* mcontext = static_cast<const unsigned char*>(ucontext) + McontextOffset;
++    std::uintptr_t addr;
++    std::memcpy(&addr, mcontext + McAddr, sizeof(addr));
++    if (CommitAddress(addr)) {
++        return; // the access runs again and now finds memory
++    }
++    if (const FaultChain next = g_next.load(std::memory_order_acquire)) {
++        next(signal, ucontext);
++    }
++}
++
++} // Anonymous namespace
++
++void InstallFaultHandler(FaultChain next) {
++    g_next.store(next, std::memory_order_release);
++    static const bool installed = [] {
++        sceKernelInstallExceptionHandler(SigSegv, FaultHandler);
++        sceKernelInstallExceptionHandler(SigBus, FaultHandler);
++        return true;
++    }();
++    (void)installed;
++}
++
++void* ReserveLazy(std::size_t size, const char* name) {
++    size = (size + Chunk - 1) & ~(Chunk - 1);
++    if (size == 0) {
++        return nullptr;
++    }
++    void* base = nullptr;
++    if (sceKernelReserveVirtualRange(&base, size, 0, Chunk) != 0 || base == nullptr) {
++        return nullptr;
++    }
++    const std::size_t chunks = size / Chunk;
++    auto* phys = new (std::nothrow) std::atomic<off_t>[chunks];
++    if (phys == nullptr) {
++        sceKernelMunmap(base, size);
++        return nullptr;
++    }
++    for (std::size_t i = 0; i < chunks; ++i) {
++        phys[i].store(-1, std::memory_order_relaxed);
++    }
++    SpinGuard guard;
++    // Reuse a released slot first, so ranges that come and go do not fill the table.
++    int count = g_region_count.load(std::memory_order_relaxed);
++    int slot = -1;
++    for (int i = 0; i < count; ++i) {
++        if (g_regions[i].size == 0) {
++            slot = i;
++            break;
++        }
++    }
++    if (slot < 0) {
++        if (count == MaxRegions) {
++            delete[] phys;
++            sceKernelMunmap(base, size);
++            return nullptr;
++        }
++        slot = count;
++    }
++    g_regions[slot].base = reinterpret_cast<std::uintptr_t>(base);
++    g_regions[slot].phys = phys;
++    g_regions[slot].name = name;
++    g_regions[slot].size = size;
++    if (slot == count) {
++        g_region_count.store(count + 1, std::memory_order_release);
++    }
++    g_reserved.fetch_add(size, std::memory_order_relaxed);
++    return base;
++}
++
++void ReleaseLazy(void* base) {
++    std::atomic<off_t>* phys = nullptr;
++    std::size_t size = 0;
++    {
++        SpinGuard guard;
++        Region* r = FindRegion(reinterpret_cast<std::uintptr_t>(base));
++        if (r == nullptr || r->base != reinterpret_cast<std::uintptr_t>(base)) {
++            return;
++        }
++        phys = r->phys;
++        size = r->size;
++        r->size = 0;
++        r->phys = nullptr;
++    }
++    sceKernelMunmap(base, size);
++    for (std::size_t i = 0; i < size / Chunk; ++i) {
++        const off_t p = phys[i].load(std::memory_order_relaxed);
++        if (p != -1) {
++            sceKernelReleaseDirectMemory(p, Chunk);
++            g_committed.fetch_sub(Chunk, std::memory_order_relaxed);
++        }
++    }
++    g_reserved.fetch_sub(size, std::memory_order_relaxed);
++    delete[] phys;
++}
++
++bool CommitLazy(void* addr, std::size_t size) {
++    const auto start = reinterpret_cast<std::uintptr_t>(addr);
++    Region* r = FindRegion(start);
++    if (r == nullptr || size == 0) {
++        return r != nullptr;
++    }
++    const std::size_t first = (start - r->base) / Chunk;
++    const std::size_t last = (start + size - 1 - r->base) / Chunk;
++    SpinGuard guard;
++    for (std::size_t i = first; i <= last && i < r->size / Chunk; ++i) {
++        if (!CommitChunkLocked(*r, i)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++bool IsCommitted(const void* addr) {
++    const auto a = reinterpret_cast<std::uintptr_t>(addr);
++    const Region* r = FindRegion(a);
++    if (r == nullptr) {
++        return true;
++    }
++    return r->phys[(a - r->base) / Chunk].load(std::memory_order_acquire) != -1;
++}
++
++void FillLazy(void* addr, std::size_t size, std::uint8_t value) {
++    auto* p = static_cast<unsigned char*>(addr);
++    if (value != 0 || FindRegion(reinterpret_cast<std::uintptr_t>(addr)) == nullptr) {
++        std::memset(p, value, size);
++        return;
++    }
++    while (size != 0) {
++        const auto a = reinterpret_cast<std::uintptr_t>(p);
++        const std::size_t in_chunk = Chunk - (a & (Chunk - 1));
++        const std::size_t n = in_chunk < size ? in_chunk : size;
++        if (IsCommitted(p)) {
++            std::memset(p, 0, n);
++        }
++        p += n;
++        size -= n;
++    }
++}
++
++Stats GetStats() {
++    return {g_reserved.load(), g_committed.load(), g_failures.load()};
++}
++
++} // namespace Common::Orbis
+diff --git a/src/common/orbis_lazy_memory.h b/src/common/orbis_lazy_memory.h
+new file mode 100644
+index 0000000..9a49124
+--- /dev/null
++++ b/src/common/orbis_lazy_memory.h
+@@ -0,0 +1,49 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// PS4 (OpenOrbis): address ranges that get memory only where they are touched.
++//
++// The console gives a process ~4.4 GiB of direct memory, of which the GPU driver takes ~1 GiB,
++// and a Switch has 4 GiB of RAM plus the emulator's own tables (a 39-bit guest page table alone
++// is 1 GiB). Nothing that size can be allocated up front, and anonymous mappings come from a
++// ~400 MiB pool. So these ranges are only reserved; the first access to each 64 KiB chunk faults,
++// and the fault handler maps a zeroed chunk of direct memory there and lets the access retry.
++
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++namespace Common::Orbis {
++
++/// Called for faults that are not a first touch of a lazy range (a real crash).
++using FaultChain = void (*)(int signal, void* ucontext);
++
++/// Installs the lazy-commit fault handler (SIGSEGV and SIGBUS). Faults it does not own go to
++/// `next`. Safe to call more than once; the last `next` wins.
++void InstallFaultHandler(FaultChain next);
++
++/// Reserves `size` bytes of address space (rounded up to 64 KiB) that commit on first touch.
++/// Returns nullptr if the address space or the region table is exhausted.
++void* ReserveLazy(std::size_t size, const char* name);
++
++/// Unmaps a range from ReserveLazy and gives its committed memory back.
++void ReleaseLazy(void* base);
++
++/// Commits [addr, addr + size) now (no-op for parts already committed). False on failure or if
++/// the range is not lazy.
++bool CommitLazy(void* addr, std::size_t size);
++
++/// Whether the 64 KiB chunk holding `addr` has memory. Addresses outside lazy ranges: true.
++bool IsCommitted(const void* addr);
++
++/// Fills [addr, addr + size) with `value`; chunks that were never touched are skipped when the
++/// value is zero, because a chunk is zeroed when it is committed.
++void FillLazy(void* addr, std::size_t size, std::uint8_t value);
++
++struct Stats {
++    std::size_t reserved_bytes;
++    std::size_t committed_bytes;
++    std::size_t commit_failures;
++};
++Stats GetStats();
++
++} // namespace Common::Orbis
+diff --git a/src/common/sparse_large_vector.cpp b/src/common/sparse_large_vector.cpp
+index ce6455a..e13b718 100644
+--- a/src/common/sparse_large_vector.cpp
++++ b/src/common/sparse_large_vector.cpp
+@@ -15,6 +15,9 @@
+ #include "common/alignment.h"
+ #include "common/assert.h"
+ #include "common/sparse_large_vector.h"
++#ifdef __ORBIS__
++#include "common/orbis_lazy_memory.h"
++#endif
+ 
+ namespace Common {
+ 
+@@ -118,6 +121,10 @@ void* AllocateMemoryPages(std::size_t size) noexcept {
+         base = VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_READWRITE);
+     }
+     ASSERT_MSG(base, "Failed to reserve {:#x} sized region with error {}", size, GetLastError());
++#elif defined(__ORBIS__)
++    // PS4: reserved only; pages get memory when CommitPage (or a first touch) asks for it.
++    void* base = Orbis::ReserveLazy(size, "sparse vector");
++    ASSERT_MSG(base, "Failed to reserve {:#x} sized region", size);
+ #else
+     void* base = mmap(nullptr, size, PROT_READ, MAP_ANON | MAP_PRIVATE | MAP_NOCORE, -1, 0);
+     if (base == MAP_FAILED)
+@@ -127,6 +134,13 @@ void* AllocateMemoryPages(std::size_t size) noexcept {
+     return base;
+ }
+ 
++#ifdef __ORBIS__
++void CommitPs4Page(uintptr_t page) noexcept {
++    ASSERT_MSG(Orbis::CommitLazy(reinterpret_cast<void*>(page), HostPageSize),
++               "Out of memory committing a large vector page at {:#x}", page);
++}
++#endif
++
+ void FreeMemoryPages(void* base, [[maybe_unused]] std::size_t size) noexcept {
+     if (auto page = HostPageSize; size % page != 0) {
+         size = AlignUp(size, page);
+@@ -135,6 +149,8 @@ void FreeMemoryPages(void* base, [[maybe_unused]] std::size_t size) noexcept {
+         return;
+ #ifdef _WIN32
+     ASSERT(VirtualFree(base, 0, MEM_RELEASE));
++#elif defined(__ORBIS__)
++    Orbis::ReleaseLazy(base);
+ #else
+     ASSERT(munmap(base, size) == 0);
+ #endif
+diff --git a/src/common/sparse_large_vector.h b/src/common/sparse_large_vector.h
+index 8265fca..4818b05 100644
+--- a/src/common/sparse_large_vector.h
++++ b/src/common/sparse_large_vector.h
+@@ -37,6 +37,10 @@ const u64 HostPageMask = ~(HostPageSize - 1);
+ #endif
+ 
+ void* AllocateMemoryPages(std::size_t size) noexcept;
++#ifdef __ORBIS__
++/// PS4: gives the lazy range page holding `page` its memory (common/orbis_lazy_memory).
++void CommitPs4Page(uintptr_t page) noexcept;
++#endif
+ void FreeMemoryPages(void* base, std::size_t size) noexcept;
+ 
+ /// A large page-aligned buffer that has optimized memory usage for zero-writes.
+@@ -90,7 +94,7 @@ public:
+ 
+     /// Returns a reference to the value of the requested index if initialized, or will otherwise return a zero-initialized object.
+     const T& GetOrDefault(std::size_t index) const {
+-#ifdef _WIN32
++#if defined(_WIN32) || defined(__ORBIS__)
+         if (!IsCommittedPage(index)) {
+             return *reinterpret_cast<const T*>(&default_val);
+         }
+@@ -178,6 +182,8 @@ private:
+         auto page = reinterpret_cast<uintptr_t>(base_ptr + index) & HostPageMask;
+ #if defined(_WIN32)
+         CommitVectorPage(page, true);
++#elif defined(__ORBIS__)
++        CommitPs4Page(page);
+ #else
+         mprotect(reinterpret_cast<void*>(page), HostPageSize, PROT_READ | PROT_WRITE);
+ #endif
+@@ -189,7 +195,7 @@ private:
+     T* base_ptr{};
+ 
+     std::vector<std::atomic<u64>> committed_pages{};
+-#ifdef _WIN32
++#if defined(_WIN32) || defined(__ORBIS__)
+     const std::array<u8, sizeof(T)> default_val{};
+ #endif
+ };
+-- 
+2.56.0.windows.1
+

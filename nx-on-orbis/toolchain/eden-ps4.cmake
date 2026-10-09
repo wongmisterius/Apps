@@ -1,0 +1,34 @@
+# PS4 toolchain for Eden: the orbis-sdk toolchain, with LLVM 18's libc++ (built by eden-ps4 in
+# libcxx18/) in place of the SDK's libc++ 11, and the include overlay that makes musl's headers
+# agree with it (toolchain/include-overlay: math.h, stdlib.h).
+include("C:/Users/alejo/eden-ps4/sdk-dl/orbis-sdk-v1/toolchain/orbis-sdk.cmake")
+set(EDEN_PS4_LIBCXX "C:/Users/alejo/eden-ps4/libcxx18")
+set(EDEN_PS4_OVERLAY "C:/Users/alejo/eden-ps4/toolchain/include-overlay")
+string(REPLACE "-isystem ${OO_PS4_TOOLCHAIN}/include/c++/v1"
+       "-nostdinc++ -fexperimental-library -isystem ${EDEN_PS4_LIBCXX}/include/c++/v1 -isystem ${EDEN_PS4_OVERLAY}"
+       CMAKE_CXX_FLAGS_INIT "${CMAKE_CXX_FLAGS_INIT}")
+string(REPLACE "-isystem ${ORBIS_COMPAT_DIR}/include"
+       "-isystem ${EDEN_PS4_OVERLAY} -isystem ${ORBIS_COMPAT_DIR}/include"
+       CMAKE_C_FLAGS_INIT "${CMAKE_C_FLAGS_INIT}")
+if(NOT CMAKE_CXX_FLAGS_INIT MATCHES "libcxx18")
+  message(FATAL_ERROR "eden-ps4.cmake: could not swap the SDK's libc++ include for libcxx18")
+endif()
+# -L to the new libc++ first, so -lc++ finds it and never the SDK's (which also carries an
+# unwinder and libc++abi 11 inside it); the unwinder then comes from the SDK's libunwind.a.
+string(REPLACE "-L${OO_PS4_TOOLCHAIN}/lib" "-L${EDEN_PS4_LIBCXX}/lib -L${OO_PS4_TOOLCHAIN}/lib"
+       CMAKE_EXE_LINKER_FLAGS_INIT "${CMAKE_EXE_LINKER_FLAGS_INIT}")
+set(CMAKE_C_STANDARD_LIBRARIES   "-lc++experimental -lc++ -lc++abi -lunwind -lc -lkernel ${ORBIS_CRT1}")
+set(CMAKE_CXX_STANDARD_LIBRARIES "${CMAKE_C_STANDARD_LIBRARIES}")
+# Frame pointers everywhere: the console's crash reports walk rbp (no debugger on the PS4).
+set(CMAKE_C_FLAGS_INIT "${CMAKE_C_FLAGS_INIT} -fno-omit-frame-pointer")
+set(CMAKE_CXX_FLAGS_INIT "${CMAKE_CXX_FLAGS_INIT} -fno-omit-frame-pointer")
+# Emulated TLS for everything built here (Eden and its bundled libraries): Eden has ~9 KiB of
+# initialised thread_local data, and on the console the native static-TLS block came out
+# misplaced (eden-ps4 test 1: KernelCore's thread_local read the neighbouring field). ProsperoEden
+# builds Eden the same way on the PS5. The runtime is compiler-rt's emutls.c (frontend/emutls).
+set(CMAKE_C_FLAGS_INIT "${CMAKE_C_FLAGS_INIT} -femulated-tls")
+set(CMAKE_CXX_FLAGS_INIT "${CMAKE_CXX_FLAGS_INIT} -femulated-tls")
+# The PS4's CPU (AMD Jaguar): SSE4.2, AVX, BMI1, F16C, MOVBE, POPCNT/LZCNT, tuned for its 128-bit
+# units. Without it the compiler targets baseline x86-64 (SSE2), and races were CPU-bound (test 22).
+set(CMAKE_C_FLAGS_INIT "${CMAKE_C_FLAGS_INIT} -march=btver2")
+set(CMAKE_CXX_FLAGS_INIT "${CMAKE_CXX_FLAGS_INIT} -march=btver2")

@@ -1,0 +1,456 @@
+From 0553bf6bc7901a8dcbb2fb14edb66c6f081b99be Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 17:26:11 -0300
+Subject: [PATCH 16/27] PS4 test 14: fence texture retirement and capture
+ bounded color diagnostics
+
+---
+ src/video_core/delayed_destruction_ring.h     |   9 ++
+ src/video_core/host1x/vic.cpp                 | 150 ++++++++++++++----
+ .../renderer_vulkan/vk_pipeline_cache.cpp     |  49 ++++++
+ .../renderer_vulkan/vk_scheduler.cpp          |  26 ++-
+ src/video_core/texture_cache/texture_cache.h  |  48 ++++--
+ 5 files changed, 242 insertions(+), 40 deletions(-)
+
+diff --git a/src/video_core/delayed_destruction_ring.h b/src/video_core/delayed_destruction_ring.h
+index 1f7af86..15fb7a2 100644
+--- a/src/video_core/delayed_destruction_ring.h
++++ b/src/video_core/delayed_destruction_ring.h
+@@ -17,6 +17,15 @@ namespace VideoCommon {
+ template <typename T, size_t TICKS_TO_DESTROY>
+ class DelayedDestructionRing {
+ public:
++    /// Objects that the next Tick would destroy; callers can synchronize before retiring them.
++    [[nodiscard]] size_t PendingDestructionCount() const {
++        return elements[(index + 1) % TICKS_TO_DESTROY].size();
++    }
++
++    [[nodiscard]] bool HasPendingDestruction() const {
++        return PendingDestructionCount() != 0;
++    }
++
+     void Tick() {
+         index = (index + 1) % TICKS_TO_DESTROY;
+         elements[index].clear();
+diff --git a/src/video_core/host1x/vic.cpp b/src/video_core/host1x/vic.cpp
+index 1d83a87..4f1c967 100644
+--- a/src/video_core/host1x/vic.cpp
++++ b/src/video_core/host1x/vic.cpp
+@@ -5,6 +5,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <array>
++#ifdef __ORBIS__
++#include <atomic>
++#endif
+ #include <cstdio>
+ #include <tuple>
+ #include <stdint.h>
+@@ -83,6 +86,74 @@ void SwizzleSurface(std::span<u8> output, u32 out_stride, std::span<const u8> in
+     }
+ }
+ 
++#ifdef __ORBIS__
++// Capture the first effective decoded output, in linear order before guest swizzling.
++// Strip padding and cap the dump at 8 MiB; never make a GPU pipeline for diagnosis.
++void Ps4DumpVicFrame(std::span<const u8> luma, std::span<const u8> chroma,
++                    u32 width, u32 height, u32 bytes_per_pixel, u32 luma_stride,
++                    u32 chroma_row_bytes, u32 chroma_height, u32 chroma_stride, u32 format) {
++    static std::atomic_bool attempted{false};
++    if (attempted.load(std::memory_order_relaxed)) {
++        return;
++    }
++    constexpr size_t MaxBytes = 8 * 1024 * 1024;
++    const size_t row_bytes = size_t(width) * bytes_per_pixel;
++    const size_t luma_bytes = row_bytes * height;
++    const size_t chroma_bytes = size_t(chroma_row_bytes) * chroma_height;
++    if (luma.data() == nullptr || width == 0 || height == 0 || width > 4096 || height > 4096 ||
++        (bytes_per_pixel != 1 && bytes_per_pixel != 4) ||
++        (chroma_bytes != 0 && chroma.data() == nullptr) ||
++        row_bytes > luma_stride || size_t(luma_stride) * height > luma.size() ||
++        chroma_row_bytes > chroma_stride ||
++        size_t(chroma_stride) * chroma_height > chroma.size() ||
++        luma_bytes > MaxBytes || chroma_bytes > MaxBytes - luma_bytes) {
++        static std::atomic_uint invalid_logs{0};
++        if (invalid_logs.fetch_add(1, std::memory_order_relaxed) < 4) {
++            LOG_WARNING(HW_GPU, "PS4 VIC dump skipped: invalid/oversized {}x{} format {}", width,
++                        height, format);
++        }
++        return;
++    }
++    if (attempted.exchange(true, std::memory_order_relaxed)) {
++        return;
++    }
++    auto* raw = std::fopen("/data/edenps4/vic_frame.raw", "wb");
++    bool ok = raw != nullptr;
++    if (raw) {
++        auto write_rows = [raw](std::span<const u8> plane, size_t stride, size_t bytes,
++                               u32 rows) {
++            for (u32 y = 0; y < rows; ++y) {
++                if (std::fwrite(plane.data() + size_t(y) * stride, 1, bytes, raw) != bytes) {
++                    return false;
++                }
++            }
++            return true;
++        };
++        ok = write_rows(luma, luma_stride, row_bytes, height);
++        if (ok && chroma_bytes != 0) {
++            ok = write_rows(chroma, chroma_stride, chroma_row_bytes, chroma_height);
++        }
++        ok = std::fclose(raw) == 0 && ok;
++    }
++    auto* meta = std::fopen("/data/edenps4/vic_frame.txt", "w");
++    bool meta_ok = meta != nullptr;
++    if (meta) {
++        meta_ok = std::fprintf(meta,
++            "test14 effective VIC output; raw_complete %u\n"
++            "width %u height %u format %u bytes_per_pixel %u\n"
++            "luma_source_stride %u raw_row_bytes %zu raw_luma_bytes %zu\n"
++            "chroma_source_stride %u raw_row_bytes %u rows %u raw_chroma_bytes %zu\n"
++            "raw layout: tightly packed luma/RGB, then interleaved U,V chroma (if present); no padding\n"
++            "RGB formats: 31=A8B8G8R8 (R,G,B,A bytes), 32=A8R8G8B8 (B,G,R,A bytes), 35=X8B8G8R8\n",
++            unsigned(ok), width, height, format, bytes_per_pixel, luma_stride, row_bytes,
++            luma_bytes, chroma_stride, chroma_row_bytes, chroma_height, chroma_bytes) >= 0;
++        meta_ok = std::fclose(meta) == 0 && meta_ok;
++    }
++    LOG_WARNING(HW_GPU, "PS4 VIC dump: raw_complete={} metadata_complete={} {}x{} format {} bytes {}",
++                ok, meta_ok, width, height, format, luma_bytes + chroma_bytes);
++}
++#endif
++
+ } // namespace
+ 
+ Vic::Vic(Host1x& host1x_, s32 id_, u32 syncpt) noexcept
+@@ -126,6 +197,29 @@ void Vic::Execute() noexcept {
+                 if (nvdec_id == -1)
+                     nvdec_id = host1x.frame_queue.VicFindNvdecFdFromOffset(luma_offset);
+                 if (auto frame = host1x.frame_queue.GetFrame(nvdec_id, luma_offset); frame.get()) {
++#ifdef __ORBIS__
++                    static std::atomic_uint frame_logs{0};
++                    if (frame_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
++                        const char* pixel_name = av_get_pix_fmt_name(frame->GetPixelFormat());
++                        LOG_INFO(HW_GPU,
++                            "PS4 VIC decoded: ffmpeg={} ({}) {}x{} strides={}/{}/{} slot_format={} "
++                            "out_format={} surface={}x{} luma={}x{} chroma={}x{} block={} "
++                            "matrix_enable={} out_matrix_enable={}",
++                            u32(frame->GetPixelFormat()), pixel_name ? pixel_name : "unknown",
++                            frame->GetWidth(), frame->GetHeight(), frame->GetStride(0),
++                            frame->GetStride(1), frame->GetStride(2),
++                            u32(slot_config.surface_config.slot_pixel_format.Value()),
++                            u32(config.output_surface_config.out_pixel_format.Value()),
++                            u32(output_width), u32(output_height),
++                            u32(config.output_surface_config.out_luma_width + 1),
++                            u32(config.output_surface_config.out_luma_height + 1),
++                            u32(config.output_surface_config.out_chroma_width + 1),
++                            u32(config.output_surface_config.out_chroma_height + 1),
++                            u32(config.output_surface_config.out_block_kind.Value()),
++                            u32(slot_config.color_matrix.matrix_enable.Value()),
++                            u32(config.out_color_matrix.matrix_enable.Value()));
++                    }
++#endif
+                     switch (frame->GetPixelFormat()) {
+                     case AV_PIX_FMT_YUV420P:
+                         ReadY8__V8U8_N420(slot_config, regs.surfaces[i], std::move(frame), true);
+@@ -886,6 +980,16 @@ void Vic::WriteY8__V8U8_N420(const OutputSurfaceConfig& output_surface_config) n
+         luma_scratch.resize_destructive(out_luma_size);
+         chroma_scratch.resize_destructive(out_chroma_size);
+         Decode(luma_scratch.data(), chroma_scratch.data());
++#ifdef __ORBIS__
++        if (has_decoded_frame) {
++            Ps4DumpVicFrame({luma_scratch.data(), size_t(out_luma_size)},
++                            {chroma_scratch.data(), size_t(out_chroma_size)},
++                            surface_width, surface_height, 1, out_luma_stride,
++                            (std::min)(u32(out_chroma_width * 2), u32(surface_width)),
++                            (std::min)(u32(out_chroma_height), u32((surface_height + 1) / 2)),
++                            out_chroma_stride, u32(output_surface_config.out_pixel_format.Value()));
++        }
++#endif
+ 
+         Tegra::Memory::GpuGuestMemoryScoped<u8, Core::Memory::GuestMemoryFlags::SafeWrite> out_luma(host1x.gmmu_manager, regs.output_surface.luma.Address(), out_luma_swizzle_size, &swizzle_scratch);
+         Tegra::Memory::GpuGuestMemoryScoped<u8, Core::Memory::GuestMemoryFlags::SafeWrite> out_chroma(host1x.gmmu_manager, regs.output_surface.chroma_u.Address(), out_chroma_swizzle_size, &swizzle_scratch);
+@@ -916,6 +1020,16 @@ void Vic::WriteY8__V8U8_N420(const OutputSurfaceConfig& output_surface_config) n
+         luma_scratch.resize_destructive(out_luma_size);
+         chroma_scratch.resize_destructive(out_chroma_size);
+         Decode(luma_scratch.data(), chroma_scratch.data());
++#ifdef __ORBIS__
++        if (has_decoded_frame) {
++            Ps4DumpVicFrame({luma_scratch.data(), size_t(out_luma_size)},
++                            {chroma_scratch.data(), size_t(out_chroma_size)},
++                            surface_width, surface_height, 1, out_luma_stride,
++                            (std::min)(u32(out_chroma_width * 2), u32(surface_width)),
++                            (std::min)(u32(out_chroma_height), u32((surface_height + 1) / 2)),
++                            out_chroma_stride, u32(output_surface_config.out_pixel_format.Value()));
++        }
++#endif
+         host1x.gmmu_manager.WriteBlock(regs.output_surface.luma.Address(), luma_scratch.data(), out_luma_size);
+         host1x.gmmu_manager.WriteBlock(regs.output_surface.chroma_u.Address(), chroma_scratch.data(), out_chroma_size);
+     } break;
+@@ -925,30 +1039,6 @@ void Vic::WriteY8__V8U8_N420(const OutputSurfaceConfig& output_surface_config) n
+     }
+ }
+ 
+-#ifdef __ORBIS__
+-namespace {
+-/// Diagnosis for red/blue-swapped videos on the PS4 port: the 60th frame VIC writes, as raw bytes
+-/// in /data/edenps4/vic_frame.raw, described in vic_frame.txt (once per run).
+-void Ps4DumpVicFrame(const u8* data, u32 width, u32 height, u32 stride_bytes, u32 format) {
+-    static int frames = 0;
+-    if (++frames != 60) {
+-        return;
+-    }
+-    if (std::FILE* f = std::fopen("/data/edenps4/vic_frame.raw", "wb")) {
+-        std::fwrite(data, 1, size_t(stride_bytes) * height, f);
+-        std::fclose(f);
+-    }
+-    if (std::FILE* f = std::fopen("/data/edenps4/vic_frame.txt", "w")) {
+-        std::fprintf(f, "width %u height %u stride %u format %u (31=A8B8G8R8 32=A8R8G8B8 35=X8B8G8R8)\n",
+-                     width, height, stride_bytes, format);
+-        std::fclose(f);
+-    }
+-    LOG_WARNING(HW_GPU, "PS4: VIC frame dumped, {}x{} stride {} format {}", width, height,
+-                stride_bytes, format);
+-}
+-} // Anonymous namespace
+-#endif
+-
+ void Vic::WriteABGR(const OutputSurfaceConfig& output_surface_config, VideoPixelFormat format) noexcept {
+     constexpr u32 BytesPerPixel = 4;
+ 
+@@ -1076,8 +1166,10 @@ void Vic::WriteABGR(const OutputSurfaceConfig& output_surface_config, VideoPixel
+         luma_scratch.resize_destructive(out_luma_size);
+         Decode(luma_scratch.data(), output_surface.data());
+ #ifdef __ORBIS__
+-        Ps4DumpVicFrame(luma_scratch.data(), out_luma_width, out_luma_height, out_luma_stride,
+-                        u32(format));
++        if (has_decoded_frame) {
++            Ps4DumpVicFrame({luma_scratch.data(), size_t(out_luma_size)}, {}, surface_width,
++                            surface_height, 4, out_luma_stride, 0, 0, 0, u32(format));
++        }
+ #endif
+ 
+         Tegra::Memory::GpuGuestMemoryScoped<u8, Core::Memory::GuestMemoryFlags::SafeWrite> out_luma(host1x.gmmu_manager, regs.output_surface.luma.Address(), out_swizzle_size, &swizzle_scratch);
+@@ -1098,8 +1190,10 @@ void Vic::WriteABGR(const OutputSurfaceConfig& output_surface_config, VideoPixel
+         Tegra::Memory::GpuGuestMemoryScoped<u8, Core::Memory::GuestMemoryFlags::SafeWrite> out_luma(host1x.gmmu_manager, regs.output_surface.luma.Address(), out_luma_size, &luma_scratch);
+         Decode(out_luma.data(), output_surface.data());
+ #ifdef __ORBIS__
+-        Ps4DumpVicFrame(out_luma.data(), out_luma_width, out_luma_height, out_luma_stride,
+-                        u32(format));
++        if (has_decoded_frame) {
++            Ps4DumpVicFrame({out_luma.data(), size_t(out_luma_size)}, {}, surface_width,
++                            surface_height, 4, out_luma_stride, 0, 0, 0, u32(format));
++        }
+ #endif
+     } break;
+     default:
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index b45a6dd..5fc9814 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -5,6 +5,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#ifdef __ORBIS__
++#include <atomic>
++#endif
+ #include <cstddef>
+ #include <fstream>
+ #include <iostream>
+@@ -481,6 +484,24 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+         .support_conditional_barrier = device.SupportsConditionalBarriers(),
+     };
+     host_info.ApplyDescriptorLimitPolicy();
++#ifdef __ORBIS__
++    static std::atomic_bool profile_logged{false};
++    if (!profile_logged.exchange(true, std::memory_order_relaxed)) {
++        LOG_INFO(Render_Vulkan,
++        "PS4 shader profile: spirv={:#x} fp16={} fp64={} int8={} int16={} int64={} "
++        "float_controls={} fp16_denorm_preserve={} fp16_denorm_flush={} "
++        "fp32_denorm_preserve={} fp32_denorm_flush={} gather_offset={} "
++        "typeless_loads={} aliasing={} subgroup_stages={:#x} layer={} snorm_rt={} ssbo_align={}",
++        profile.supported_spirv, host_info.support_float16, host_info.support_float64,
++        profile.support_int8, profile.support_int16, profile.support_int64,
++        profile.support_float_controls, profile.support_fp16_denorm_preserve,
++        profile.support_fp16_denorm_flush, profile.support_fp32_denorm_preserve,
++        profile.support_fp32_denorm_flush, profile.need_gather_subpixel_offset,
++        profile.support_typeless_image_loads, profile.support_descriptor_aliasing,
++        profile.supported_subgroup_stages, host_info.support_viewport_index_layer,
++        host_info.support_snorm_render_buffer, host_info.min_ssbo_alignment);
++    }
++#endif
+ 
+     if (device.GetMaxVertexInputAttributes() < Maxwell::NumVertexAttributes) {
+         LOG_WARNING(Render_Vulkan, "maxVertexInputAttributes is too low: {} < {}",
+@@ -798,6 +819,20 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+              hash, key.unique_hashes[0] != 0, key.unique_hashes[1] != 0, key.unique_hashes[2] != 0,
+              key.unique_hashes[3] != 0, key.unique_hashes[4] != 0, key.unique_hashes[5] != 0,
+              u32(key.state.topology.Value()));
++    static std::atomic_uint pipeline_logs{0};
++    if (pipeline_logs.fetch_add(1, std::memory_order_relaxed) < 256) {
++        LOG_INFO(Render_Vulkan,
++            "PS4 pipeline detail {:016x}: vsA={:016x} vsB={:016x} tcs={:016x} tes={:016x} "
++            "gs={:016x} fs={:016x} topology={} depth={}/{} "
++            "guest_color_formats={:#x}/{:#x}/{:#x}/{:#x}/{:#x}/{:#x}/{:#x}/{:#x}",
++            hash, key.unique_hashes[0], key.unique_hashes[1], key.unique_hashes[2],
++            key.unique_hashes[3], key.unique_hashes[4], key.unique_hashes[5],
++            u32(key.state.topology.Value()), u32(key.state.depth_enabled.Value()),
++            u32(key.state.depth_format.Value()), key.state.color_formats[0],
++            key.state.color_formats[1], key.state.color_formats[2], key.state.color_formats[3],
++            key.state.color_formats[4], key.state.color_formats[5], key.state.color_formats[6],
++            key.state.color_formats[7]);
++    }
+ #endif
+     size_t env_index{0};
+     std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
+@@ -866,6 +901,20 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+         ConvertLegacyToGeneric(program, runtime_info);
+         const std::vector<u32> code{EmitSPIRV(profile, runtime_info, program, binding)};
++#ifdef __ORBIS__
++        if (program.stage == Shader::Stage::Fragment) {
++            static std::atomic_uint fragment_logs{0};
++            if (fragment_logs.fetch_add(1, std::memory_order_relaxed) < 128) {
++                const auto spirv_hash = Common::CityHash64(
++                    reinterpret_cast<const char*>(code.data()), code.size() * sizeof(u32));
++                LOG_INFO(Render_Vulkan,
++                    "PS4 fragment: pipeline={:016x} guest={:016x} spirv={:016x} words={} "
++                    "dual_source={} early_z={}",
++                    hash, key.unique_hashes[index], spirv_hash, code.size(),
++                    runtime_info.dual_source_blend, runtime_info.force_early_z);
++            }
++        }
++#endif
+         device.SaveShader(code);
+         modules[stage_index] = BuildShader(device, code);
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index a2c4592..596e56c 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -25,6 +25,12 @@
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ 
++#ifdef __ORBIS__
++// A lock-free frontend breadcrumb, emitted only on a crash; no disk I/O per render pass.
++extern "C" void EdenPs4OnRenderPass(u64 renderpass, u64 framebuffer, u64 first_image,
++                                    u32 num_images, u64 tick) __attribute__((weak));
++#endif
++
+ namespace Vulkan {
+ 
+ void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,
+@@ -112,8 +118,16 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
+     for (u32 i = 0; i < clear_value_count && i < values.size(); ++i) {
+         values[i] = clear_values[i];
+     }
+-    Record([renderpass, framebuffer_handle, render_area, values, clear_value_count](
+-               vk::CommandBuffer cmdbuf) {
++#ifdef __ORBIS__
++    const u32 breadcrumb_images = framebuffer->NumImages();
++    const VkImage breadcrumb_image = breadcrumb_images != 0 ? framebuffer->Images()[0] : VkImage{};
++    const u64 breadcrumb_tick = CurrentTick();
++#endif
++    Record([renderpass, framebuffer_handle, render_area, values, clear_value_count
++#ifdef __ORBIS__
++            , breadcrumb_images, breadcrumb_image, breadcrumb_tick
++#endif
++            ](vk::CommandBuffer cmdbuf) {
+         const VkRenderPassBeginInfo renderpass_bi{
+             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+             .pNext = nullptr,
+@@ -127,6 +141,14 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
+             .clearValueCount = clear_value_count,
+             .pClearValues = clear_value_count != 0 ? values.data() : nullptr,
+         };
++#ifdef __ORBIS__
++        if (EdenPs4OnRenderPass) {
++            EdenPs4OnRenderPass(reinterpret_cast<u64>(renderpass),
++                               reinterpret_cast<u64>(framebuffer_handle),
++                               reinterpret_cast<u64>(breadcrumb_image), breadcrumb_images,
++                               breadcrumb_tick);
++        }
++#endif
+         cmdbuf.BeginRenderPass(renderpass_bi, VK_SUBPASS_CONTENTS_INLINE);
+     });
+     num_renderpass_images = framebuffer->NumImages();
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 85a22e3..28a8836 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -176,9 +176,30 @@ void TextureCache<P>::TickFrame() {
+     if (total_used_memory > minimum_memory) {
+         RunGarbageCollector();
+     }
++#ifdef __ORBIS__
++    const size_t retiring_framebuffers = sentenced_framebuffers.PendingDestructionCount();
++    const size_t retiring_views = sentenced_image_view.PendingDestructionCount();
++    const size_t retiring_images = sentenced_images.PendingDestructionCount();
++    if (retiring_framebuffers != 0 || retiring_views != 0 || retiring_images != 0) {
++        // A frame delay is not a GPU fence. Finish after GC: removing framebuffers may realize
++        // deferred clears and enqueue more commands which still reference these objects.
++        runtime.Finish();
++        static u64 retire_batches = 0;
++        if (++retire_batches <= 16 || retire_batches % 120 == 0) {
++            LOG_INFO(Render_Vulkan,
++                     "PS4 texture retire: batch={} frame={} GPU finished, fb={} views={} images={}",
++                     retire_batches, frame_tick, retiring_framebuffers, retiring_views,
++                     retiring_images);
++        }
++    }
++    sentenced_framebuffers.Tick();
++    sentenced_image_view.Tick();
++    sentenced_images.Tick();
++#else
+     sentenced_images.Tick();
+     sentenced_framebuffers.Tick();
+     sentenced_image_view.Tick();
++#endif
+     TickAsyncDecode();
+     TickAsyncUnswizzle();
+ 
+@@ -2322,17 +2343,12 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
+ 
+ template <class P>
+ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
++#ifdef __ORBIS__
++    // Always retire through the synchronized rings; a caller's age estimate cannot prove
++    // completion of the worker's queued render passes or the GPU's use of an attachment.
++    immediate_delete = false;
++#endif
+     ImageBase& image = slot_images[image_id];
+-    if (image.HasScaled()) {
+-        total_used_memory -= GetScaledImageSizeBytes(image);
+-    }
+-    u64 tentative_size = (std::max)(image.guest_size_bytes, image.unswizzled_size_bytes);
+-    if ((IsPixelFormatASTC(image.info.format) &&
+-         True(image.flags & ImageFlagBits::AcceleratedUpload)) ||
+-        True(image.flags & ImageFlagBits::Converted)) {
+-        tentative_size = TranscodedAstcSize(tentative_size, image.info.format);
+-    }
+-    total_used_memory -= Common::AlignUp(tentative_size, 1024);
+     const GPUVAddr gpu_addr = image.gpu_addr;
+     const auto alloc_it = image_allocs_table.find(gpu_addr);
+     if (alloc_it == image_allocs_table.end()) {
+@@ -2350,6 +2366,18 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+     ASSERT_MSG(False(image.flags & ImageFlagBits::Tracked), "Image was not untracked");
+     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");
+ 
++    // Do not subtract an image that failed the allocation/id checks above.
++    if (image.HasScaled()) {
++        total_used_memory -= GetScaledImageSizeBytes(image);
++    }
++    u64 tentative_size = (std::max)(image.guest_size_bytes, image.unswizzled_size_bytes);
++    if ((IsPixelFormatASTC(image.info.format) &&
++         True(image.flags & ImageFlagBits::AcceleratedUpload)) ||
++        True(image.flags & ImageFlagBits::Converted)) {
++        tentative_size = TranscodedAstcSize(tentative_size, image.info.format);
++    }
++    total_used_memory -= Common::AlignUp(tentative_size, 1024);
++
+     // Mark render targets as dirty
+     auto& dirty = maxwell3d->dirty.flags;
+     dirty[Dirty::RenderTargets] = true;
+-- 
+2.56.0.windows.1
+

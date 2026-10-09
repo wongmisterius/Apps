@@ -1,0 +1,97 @@
+From 73288756941296ae8210ffb3db8954aa80c2560d Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 11:21:41 -0300
+Subject: [PATCH 14/27] PS4: swizzle self-test off by default; dump one VIC
+ output frame for diagnosis
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/video_core/host1x/vic.cpp                 | 33 +++++++++++++++++++
+ .../renderer_vulkan/vk_texture_cache.cpp      |  6 ++--
+ 2 files changed, 37 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/host1x/vic.cpp b/src/video_core/host1x/vic.cpp
+index 1a89f3d..1d83a87 100644
+--- a/src/video_core/host1x/vic.cpp
++++ b/src/video_core/host1x/vic.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <array>
++#include <cstdio>
+ #include <tuple>
+ #include <stdint.h>
+ 
+@@ -924,6 +925,30 @@ void Vic::WriteY8__V8U8_N420(const OutputSurfaceConfig& output_surface_config) n
+     }
+ }
+ 
++#ifdef __ORBIS__
++namespace {
++/// Diagnosis for red/blue-swapped videos on the PS4 port: the 60th frame VIC writes, as raw bytes
++/// in /data/edenps4/vic_frame.raw, described in vic_frame.txt (once per run).
++void Ps4DumpVicFrame(const u8* data, u32 width, u32 height, u32 stride_bytes, u32 format) {
++    static int frames = 0;
++    if (++frames != 60) {
++        return;
++    }
++    if (std::FILE* f = std::fopen("/data/edenps4/vic_frame.raw", "wb")) {
++        std::fwrite(data, 1, size_t(stride_bytes) * height, f);
++        std::fclose(f);
++    }
++    if (std::FILE* f = std::fopen("/data/edenps4/vic_frame.txt", "w")) {
++        std::fprintf(f, "width %u height %u stride %u format %u (31=A8B8G8R8 32=A8R8G8B8 35=X8B8G8R8)\n",
++                     width, height, stride_bytes, format);
++        std::fclose(f);
++    }
++    LOG_WARNING(HW_GPU, "PS4: VIC frame dumped, {}x{} stride {} format {}", width, height,
++                stride_bytes, format);
++}
++} // Anonymous namespace
++#endif
++
+ void Vic::WriteABGR(const OutputSurfaceConfig& output_surface_config, VideoPixelFormat format) noexcept {
+     constexpr u32 BytesPerPixel = 4;
+ 
+@@ -1050,6 +1075,10 @@ void Vic::WriteABGR(const OutputSurfaceConfig& output_surface_config, VideoPixel
+             out_luma_stride, out_luma_size, block_height, out_swizzle_size);
+         luma_scratch.resize_destructive(out_luma_size);
+         Decode(luma_scratch.data(), output_surface.data());
++#ifdef __ORBIS__
++        Ps4DumpVicFrame(luma_scratch.data(), out_luma_width, out_luma_height, out_luma_stride,
++                        u32(format));
++#endif
+ 
+         Tegra::Memory::GpuGuestMemoryScoped<u8, Core::Memory::GuestMemoryFlags::SafeWrite> out_luma(host1x.gmmu_manager, regs.output_surface.luma.Address(), out_swizzle_size, &swizzle_scratch);
+         if (block_height == 1) {
+@@ -1068,6 +1097,10 @@ void Vic::WriteABGR(const OutputSurfaceConfig& output_surface_config, VideoPixel
+         luma_scratch.resize_destructive(out_luma_size);
+         Tegra::Memory::GpuGuestMemoryScoped<u8, Core::Memory::GuestMemoryFlags::SafeWrite> out_luma(host1x.gmmu_manager, regs.output_surface.luma.Address(), out_luma_size, &luma_scratch);
+         Decode(out_luma.data(), output_surface.data());
++#ifdef __ORBIS__
++        Ps4DumpVicFrame(out_luma.data(), out_luma_width, out_luma_height, out_luma_stride,
++                        u32(format));
++#endif
+     } break;
+     default:
+         UNREACHABLE();
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index bc7ed0e..d0f9c57 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -52,8 +52,10 @@ bool ps4_bgra_swap = false;
+ // Component mappings, measured at startup (Ps4SwizzleSelfTest): for each permutation of R,G,B,A
+ // that a guest view asks for on an 8-bit RGBA image, the mapping to hand the driver instead so
+ // that it samples what was asked. Empty when the driver applies every permutation correctly.
+-// 0 = decide by the self-test, 1 = never (set by the frontend: swizzle=off).
+-int ps4_swizzle_mode = 0;
++// 0 = run the self-test, 1 = do not (the default: test 11 found all 24 permutations correct, and
++// creating and destroying its compute pipeline at startup crashed the game's first pipeline
++// builds inside RADV; settings.txt swizzle=test runs it again).
++int ps4_swizzle_mode = 1;
+ std::vector<std::pair<std::array<u8, 4>, std::array<u8, 4>>> ps4_swizzle_fix;
+ #endif
+ 
+-- 
+2.56.0.windows.1
+

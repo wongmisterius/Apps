@@ -1,0 +1,271 @@
+From 83d2bdc04b7b9a24ca89b73d0dd3c39b761f1976 Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 20:42:08 -0300
+Subject: [PATCH 01/27] PS4: build core libraries with the orbis toolchain
+
+SDL3 optional on PS4, PS4 data paths (/data/edenps4), thread naming,
+pagesize include, Vulkan through RADV's headless surface (WindowSystemType::Orbis,
+static vkGetInstanceProcAddr), no X11/Wayland headers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                                   |  2 +-
+ externals/CMakeLists.txt                         |  6 ++++--
+ src/audio_core/CMakeLists.txt                    |  2 ++
+ src/common/fs/path_util.cpp                      |  9 +++++++++
+ src/common/sparse_large_vector.h                 |  3 +++
+ src/common/thread.cpp                            |  7 +++++++
+ src/core/frontend/emu_window.h                   |  1 +
+ src/input_common/CMakeLists.txt                  |  2 ++
+ src/video_core/vulkan_common/vulkan.h            |  2 ++
+ src/video_core/vulkan_common/vulkan_instance.cpp | 13 +++++++++++++
+ src/video_core/vulkan_common/vulkan_library.cpp  |  3 +++
+ src/video_core/vulkan_common/vulkan_surface.cpp  | 14 ++++++++++++++
+ 12 files changed, 61 insertions(+), 3 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8b068b8..74b6751 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -567,7 +567,7 @@ if (NOT YUZU_STATIC_ROOM)
+         find_package(oaknut)
+     endif()
+ 
+-    if (NOT ANDROID)
++    if (NOT ANDROID AND NOT PS4)
+         find_package(SDL3)
+     endif()
+ 
+diff --git a/externals/CMakeLists.txt b/externals/CMakeLists.txt
+index 0682f64..a5b9d3c 100644
+--- a/externals/CMakeLists.txt
++++ b/externals/CMakeLists.txt
+@@ -136,7 +136,9 @@ if(ENABLE_CUBEB)
+     endif()
+ endif()
+ 
+-if (NOT YUZU_USE_BUNDLED_SDL3)
++if (PS4)
++    # PS4: no SDL3 (input and audio come from the frontend)
++elseif (NOT YUZU_USE_BUNDLED_SDL3)
+     if (NOT WIN32)
+         # Yuzu itself needs: Atomic Audio Events Joystick Haptic Sensor Threads Timers
+         # Since 2.0.18 Atomic+Threads required for HIDAPI/libusb (see https://github.com/libsdl-org/SDL/issues/5095)
+@@ -170,7 +172,7 @@ endif()
+ 
+ # Normalize SDL3 link target across package variants.
+ # Some SDL3 packages export only SDL3::SDL3-shared or SDL3::SDL3-static.
+-if (NOT TARGET SDL3::SDL3)
++if (NOT PS4 AND NOT TARGET SDL3::SDL3)
+     if (TARGET SDL3::SDL3-shared)
+         add_library(SDL3::SDL3 ALIAS SDL3::SDL3-shared)
+     elseif (TARGET SDL3::SDL3-static)
+diff --git a/src/audio_core/CMakeLists.txt b/src/audio_core/CMakeLists.txt
+index b244d65..f307e58 100644
+--- a/src/audio_core/CMakeLists.txt
++++ b/src/audio_core/CMakeLists.txt
+@@ -238,11 +238,13 @@ if (ENABLE_CUBEB)
+     target_compile_definitions(audio_core PRIVATE HAVE_CUBEB=1)
+ endif()
+ 
++if (NOT PS4)
+ target_sources(audio_core PRIVATE
+     sink/sdl3_sink.cpp
+     sink/sdl3_sink.h)
+ 
+ target_link_libraries(audio_core PRIVATE SDL3::SDL3)
+ target_compile_definitions(audio_core PRIVATE HAVE_SDL3)
++endif()
+ 
+ create_target_directory_groups(audio_core)
+diff --git a/src/common/fs/path_util.cpp b/src/common/fs/path_util.cpp
+index b4c7eae..11dfac5 100644
+--- a/src/common/fs/path_util.cpp
++++ b/src/common/fs/path_util.cpp
+@@ -130,6 +130,13 @@ public:
+         ASSERT(!eden_path.empty());
+         eden_path_cache = eden_path / CACHE_DIR;
+         eden_path_config = eden_path / CONFIG_DIR;
++#elif defined(__ORBIS__)
++        // PS4: everything lives under /data/edenps4 (no HOME/XDG on the console)
++        if (eden_path.empty()) {
++            eden_path = "/data/edenps4";
++        }
++        eden_path_cache = eden_path / CACHE_DIR;
++        eden_path_config = eden_path / CONFIG_DIR;
+ #else
+         eden_path = GetCurrentDir() / PORTABLE_DIR;
+         if (!Exists(eden_path) || !IsDir(eden_path)) {
+@@ -172,6 +179,8 @@ public:
+         GenerateEdenPath(EdenPath::ShaderDir, eden_path_cache / SHADER_DIR);
+ #ifdef _WIN32
+         GenerateLegacyPath(EmuPath::RyujinxDir, GetAppDataRoamingDirectory() / RYUJINX_DIR);
++#elif defined(__ORBIS__)
++        GenerateLegacyPath(EmuPath::RyujinxDir, eden_path / RYUJINX_DIR);
+ #else
+         // In Ryujinx's infinite wisdom, it places EVERYTHING in the config directory on UNIX
+         // This is incredibly stupid and violates a million XDG standards, but whatever
+diff --git a/src/common/sparse_large_vector.h b/src/common/sparse_large_vector.h
+index 827944f..8265fca 100644
+--- a/src/common/sparse_large_vector.h
++++ b/src/common/sparse_large_vector.h
+@@ -28,6 +28,9 @@ constexpr u64 HostPageBits = 12;
+ constexpr u64 HostPageMask = ~(HostPageSize - 1);
+ bool CommitVectorPage(uintptr_t addr, bool write) noexcept;
+ #else
++}
++#include <unistd.h>
++namespace Common {
+ const u64 HostPageSize = sysconf(_SC_PAGESIZE);
+ const u64 HostPageBits = std::countr_zero(HostPageSize);
+ const u64 HostPageMask = ~(HostPageSize - 1);
+diff --git a/src/common/thread.cpp b/src/common/thread.cpp
+index 7b4dec3..5c2489f 100644
+--- a/src/common/thread.cpp
++++ b/src/common/thread.cpp
+@@ -447,6 +447,11 @@ void RememberCurrentThreadNice(pid_t tid, s32 nice_value) {
+ #include "common/x64/rdtsc.h"
+ #endif
+ 
++#if defined(__ORBIS__)
++// PS4: the SDK declares this only under _GNU_SOURCE (libkernel exports it)
++extern "C" int pthread_set_name_np(pthread_t, const char*);
++#endif
++
+ namespace Common {
+ 
+ void SetCurrentThreadPriority(ThreadPriority new_priority) {
+@@ -514,6 +519,8 @@ void SetCurrentThreadName(const char* name) {
+     pthread_setname_np(name);
+ #elif defined(__HAIKU__)
+     rename_thread(find_thread(NULL), name);
++#elif defined(__ORBIS__)
++    pthread_set_name_np(pthread_self(), name);
+ #elif defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
+     pthread_set_name_np(pthread_self(), name);
+ #elif defined(__NetBSD__)
+diff --git a/src/core/frontend/emu_window.h b/src/core/frontend/emu_window.h
+index ee7a769..17de4f6 100644
+--- a/src/core/frontend/emu_window.h
++++ b/src/core/frontend/emu_window.h
+@@ -26,6 +26,7 @@ enum class WindowSystemType {
+     Cocoa,
+     Android,
+     Xcb,
++    Orbis, ///< PS4 video out through RADV's headless surface (PS4 is a macro on this toolchain)
+ };
+ 
+ /**
+diff --git a/src/input_common/CMakeLists.txt b/src/input_common/CMakeLists.txt
+index 840602f..d876941 100644
+--- a/src/input_common/CMakeLists.txt
++++ b/src/input_common/CMakeLists.txt
+@@ -53,6 +53,8 @@ if (ANDROID)
+         drivers/android.h)
+ 
+     target_link_libraries(input_common PRIVATE android)
++elseif (PS4)
++    # PS4: no SDL3 or HID; the controller comes in through the frontend
+ else()
+     target_sources(input_common PRIVATE
+         drivers/joycon.cpp
+diff --git a/src/video_core/vulkan_common/vulkan.h b/src/video_core/vulkan_common/vulkan.h
+index 2609e8d..d016995 100644
+--- a/src/video_core/vulkan_common/vulkan.h
++++ b/src/video_core/vulkan_common/vulkan.h
+@@ -15,6 +15,8 @@
+ #define VK_USE_PLATFORM_ANDROID_KHR
+ #elif defined(__HAIKU__)
+ #define VK_USE_PLATFORM_XCB_KHR
++#elif defined(__ORBIS__)
++// PS4: no window system; presentation goes through VK_EXT_headless_surface (RADV video-out WSI)
+ #else
+ #define VK_USE_PLATFORM_XLIB_KHR
+ #define VK_USE_PLATFORM_WAYLAND_KHR
+diff --git a/src/video_core/vulkan_common/vulkan_instance.cpp b/src/video_core/vulkan_common/vulkan_instance.cpp
+index 7f3d8ed..e1a99a0 100644
+--- a/src/video_core/vulkan_common/vulkan_instance.cpp
++++ b/src/video_core/vulkan_common/vulkan_instance.cpp
+@@ -19,6 +19,11 @@
+ #include "video_core/vulkan_common/vulkan_instance.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ 
++#ifdef __ORBIS__
++// PS4: RADV is linked in statically; orbis-compat's vkloader exports the entry point.
++extern "C" PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char* pName);
++#endif
++
+ namespace Vulkan {
+ namespace {
+ 
+@@ -59,6 +64,10 @@ namespace {
+     case Core::Frontend::WindowSystemType::Xcb:
+         extensions.push_back(VK_KHR_XCB_SURFACE_EXTENSION_NAME);
+         break;
++#elif defined(__ORBIS__)
++    case Core::Frontend::WindowSystemType::Orbis:
++        extensions.push_back(VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME);
++        break;
+ #else
+     case Core::Frontend::WindowSystemType::X11:
+         extensions.push_back(VK_KHR_XLIB_SURFACE_EXTENSION_NAME);
+@@ -116,6 +125,9 @@ void RemoveUnavailableLayers(const vk::InstanceDispatch& dld, std::vector<const
+ vk::Instance CreateInstance(const Common::DynamicLibrary& library, vk::InstanceDispatch& dld,
+                             u32 required_version, Core::Frontend::WindowSystemType window_type,
+                             bool enable_validation) {
++#ifdef __ORBIS__
++    dld.vkGetInstanceProcAddr = &::vkGetInstanceProcAddr;
++#else
+     if (!library.IsOpen()) {
+         LOG_ERROR(Render_Vulkan, "Vulkan library not available");
+         throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
+@@ -124,6 +136,7 @@ vk::Instance CreateInstance(const Common::DynamicLibrary& library, vk::InstanceD
+         LOG_ERROR(Render_Vulkan, "vkGetInstanceProcAddr not present in Vulkan");
+         throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
+     }
++#endif
+     if (!vk::Load(dld)) {
+         LOG_ERROR(Render_Vulkan, "Failed to load Vulkan function pointers");
+         throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
+diff --git a/src/video_core/vulkan_common/vulkan_library.cpp b/src/video_core/vulkan_common/vulkan_library.cpp
+index d174a9d..7342de6 100644
+--- a/src/video_core/vulkan_common/vulkan_library.cpp
++++ b/src/video_core/vulkan_common/vulkan_library.cpp
+@@ -19,6 +19,9 @@ std::shared_ptr<Common::DynamicLibrary> OpenLibrary(
+ #if defined(__ANDROID__) && defined(ARCHITECTURE_arm64)
+     // Android manages its Vulkan driver from the frontend.
+     return context->GetDriverLibrary();
++#elif defined(__ORBIS__)
++    // PS4: RADV is statically linked; CreateInstance takes vkGetInstanceProcAddr directly.
++    return std::make_shared<Common::DynamicLibrary>();
+ #else
+     auto library = std::make_shared<Common::DynamicLibrary>();
+ #ifdef __APPLE__
+diff --git a/src/video_core/vulkan_common/vulkan_surface.cpp b/src/video_core/vulkan_common/vulkan_surface.cpp
+index 8b9dcb4..dd88d26 100644
+--- a/src/video_core/vulkan_common/vulkan_surface.cpp
++++ b/src/video_core/vulkan_common/vulkan_surface.cpp
+@@ -59,6 +59,20 @@ vk::SurfaceKHR CreateSurface(
+             throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
+         }
+     }
++#elif defined(__ORBIS__)
++    if (window_info.type == Core::Frontend::WindowSystemType::Orbis) {
++        // RADV's video-out WSI turns presents on a headless surface into flips on the TV.
++        const VkHeadlessSurfaceCreateInfoEXT headless_ci{
++            VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT, nullptr, 0};
++        const auto vkCreateHeadlessSurfaceEXT = reinterpret_cast<PFN_vkCreateHeadlessSurfaceEXT>(
++            dld.vkGetInstanceProcAddr(*instance, "vkCreateHeadlessSurfaceEXT"));
++        if (!vkCreateHeadlessSurfaceEXT ||
++            vkCreateHeadlessSurfaceEXT(*instance, &headless_ci, nullptr, &unsafe_surface) !=
++                VK_SUCCESS) {
++            LOG_ERROR(Render_Vulkan, "Failed to initialize the PS4 headless surface");
++            throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
++        }
++    }
+ #elif defined(__HAIKU__)
+     if (window_info.type == Core::Frontend::WindowSystemType::Xcb) {
+         const VkXcbSurfaceCreateInfoKHR xcb_ci{
+-- 
+2.56.0.windows.1
+

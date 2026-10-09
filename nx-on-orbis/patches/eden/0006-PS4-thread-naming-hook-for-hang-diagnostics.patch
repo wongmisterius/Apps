@@ -1,0 +1,36 @@
+From f31ca13505795c48b61787c033c6078c47217ab4 Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 23:35:27 -0300
+Subject: [PATCH 06/27] PS4: thread naming hook for hang diagnostics
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/common/thread.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/common/thread.cpp b/src/common/thread.cpp
+index 5c2489f..b4ca50d 100644
+--- a/src/common/thread.cpp
++++ b/src/common/thread.cpp
+@@ -450,6 +450,8 @@ void RememberCurrentThreadNice(pid_t tid, s32 nice_value) {
+ #if defined(__ORBIS__)
+ // PS4: the SDK declares this only under _GNU_SOURCE (libkernel exports it)
+ extern "C" int pthread_set_name_np(pthread_t, const char*);
++// PS4 frontend hook (weak): learns every named Eden thread, so a hang can dump their stacks.
++extern "C" __attribute__((weak)) void EdenPs4OnThreadNamed(pthread_t thread, const char* name);
+ #endif
+ 
+ namespace Common {
+@@ -521,6 +523,9 @@ void SetCurrentThreadName(const char* name) {
+     rename_thread(find_thread(NULL), name);
+ #elif defined(__ORBIS__)
+     pthread_set_name_np(pthread_self(), name);
++    if (EdenPs4OnThreadNamed) {
++        EdenPs4OnThreadNamed(pthread_self(), name);
++    }
+ #elif defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
+     pthread_set_name_np(pthread_self(), name);
+ #elif defined(__NetBSD__)
+-- 
+2.56.0.windows.1
+

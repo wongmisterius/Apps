@@ -1,0 +1,185 @@
+From 014633a9f3e45d73a0ca9c25dfe0c25460e16b70 Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 01:20:16 -0300
+Subject: [PATCH 07/27] PS4: page table sign extension amount (JIT fast path),
+ give freed guest pages back
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/common/host_memory.cpp                |  1 +
+ src/common/orbis_lazy_memory.cpp          | 48 ++++++++++++++++++++++-
+ src/common/orbis_lazy_memory.h            | 10 +++++
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp |  6 ++-
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp |  6 ++-
+ src/core/hle/kernel/k_memory_manager.h    | 10 +++++
+ 6 files changed, 78 insertions(+), 3 deletions(-)
+
+diff --git a/src/common/host_memory.cpp b/src/common/host_memory.cpp
+index 2630c40..30a15c5 100644
+--- a/src/common/host_memory.cpp
++++ b/src/common/host_memory.cpp
+@@ -715,6 +715,7 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
+     // PS4: the guest RAM is reserved and committed on first touch (common/orbis_lazy_memory).
+     backing_base = static_cast<u8*>(Common::Orbis::ReserveLazy(backing_size, "guest RAM"));
+     ASSERT_MSG(backing_base, "Failed to reserve {:#x} bytes for the guest RAM", backing_size);
++    Common::Orbis::SetGuestRamBase(backing_base, backing_size);
+     virtual_base = nullptr;
+ #elif defined(__OPENORBIS__) || defined(__managarm__)
+     LOG_WARNING(HW_Memory, "Platform doesn't support fastmem");
+diff --git a/src/common/orbis_lazy_memory.cpp b/src/common/orbis_lazy_memory.cpp
+index 2620d47..7ec2095 100644
+--- a/src/common/orbis_lazy_memory.cpp
++++ b/src/common/orbis_lazy_memory.cpp
+@@ -55,6 +55,9 @@ std::atomic<FaultChain> g_next{nullptr};
+ std::atomic<std::size_t> g_reserved{0};
+ std::atomic<std::size_t> g_committed{0};
+ std::atomic<std::size_t> g_failures{0};
++std::atomic<std::size_t> g_decommitted{0};
++std::atomic<unsigned char*> g_guest_base{nullptr};
++std::atomic<std::size_t> g_guest_size{0};
+ 
+ struct SpinGuard {
+     SpinGuard() {
+@@ -252,8 +255,51 @@ void FillLazy(void* addr, std::size_t size, std::uint8_t value) {
+     }
+ }
+ 
++void DecommitLazy(void* addr, std::size_t size) {
++    const auto start = reinterpret_cast<std::uintptr_t>(addr);
++    Region* r = FindRegion(start);
++    if (r == nullptr || size < Chunk) {
++        return;
++    }
++    // Whole chunks only: a partly freed chunk still holds live data.
++    const std::uintptr_t first = (start + Chunk - 1) & ~std::uintptr_t(Chunk - 1);
++    const std::uintptr_t end = (start + size) & ~std::uintptr_t(Chunk - 1);
++    SpinGuard guard;
++    for (std::uintptr_t a = first; a < end && a - r->base < r->size; a += Chunk) {
++        const std::size_t index = (a - r->base) / Chunk;
++        const off_t phys = r->phys[index].load(std::memory_order_relaxed);
++        if (phys == -1) {
++            continue;
++        }
++        // Put a reservation back over the chunk (replacing the mapping), so the address stays
++        // ours; then the physical memory can go.
++        void* at = reinterpret_cast<void*>(a);
++        if (sceKernelReserveVirtualRange(&at, Chunk, MapFixed, Chunk) != 0) {
++            at = reinterpret_cast<void*>(a);
++            sceKernelMunmap(at, Chunk);
++            sceKernelReserveVirtualRange(&at, Chunk, MapFixed, Chunk); // best effort
++        }
++        r->phys[index].store(-1, std::memory_order_release);
++        sceKernelReleaseDirectMemory(phys, Chunk);
++        g_committed.fetch_sub(Chunk, std::memory_order_relaxed);
++        g_decommitted.fetch_add(Chunk, std::memory_order_relaxed);
++    }
++}
++
++void SetGuestRamBase(void* base, std::size_t size) {
++    g_guest_size.store(size);
++    g_guest_base.store(static_cast<unsigned char*>(base));
++}
++
++void OnGuestRamFreed(std::size_t offset, std::size_t size) {
++    unsigned char* const base = g_guest_base.load();
++    if (base != nullptr && offset < g_guest_size.load()) {
++        DecommitLazy(base + offset, size);
++    }
++}
++
+ Stats GetStats() {
+-    return {g_reserved.load(), g_committed.load(), g_failures.load()};
++    return {g_reserved.load(), g_committed.load(), g_failures.load(), g_decommitted.load()};
+ }
+ 
+ } // namespace Common::Orbis
+diff --git a/src/common/orbis_lazy_memory.h b/src/common/orbis_lazy_memory.h
+index 9a49124..6e52b44 100644
+--- a/src/common/orbis_lazy_memory.h
++++ b/src/common/orbis_lazy_memory.h
+@@ -39,10 +39,20 @@ bool IsCommitted(const void* addr);
+ /// value is zero, because a chunk is zeroed when it is committed.
+ void FillLazy(void* addr, std::size_t size, std::uint8_t value);
+ 
++/// Gives back the memory of every 64 KiB chunk lying entirely inside [addr, addr + size); the
++/// range stays reserved and commits again (zeroed) on its next touch.
++void DecommitLazy(void* addr, std::size_t size);
++
++/// The guest RAM backing (HostMemory), so the kernel's page frees can be turned into decommits.
++void SetGuestRamBase(void* base, std::size_t size);
++/// Called when the emulated kernel frees guest physical memory: offset from the start of DRAM.
++void OnGuestRamFreed(std::size_t offset, std::size_t size);
++
+ struct Stats {
+     std::size_t reserved_bytes;
+     std::size_t committed_bytes;
+     std::size_t commit_failures;
++    std::size_t decommitted_bytes;
+ };
+ Stats GetStats();
+ 
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index 62cd0b5..2be6822 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -193,7 +193,11 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+             Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize()) < (1ULL << 39)) {
+             // Systems like FreeBSD allocate memory really low by default, and since we pack our page table entries,
+             // we have to manually sign extend when our actual pointer is negative.
+-            config.page_table_sign_extension = Common::PageTable::SIGN_BIT;
++            // The emitter does shl/sar by this amount after masking the entry with ATTRIBUTE_MASK (pointer
++            // bits 12..55), so it is the count of bits above the pointer (8), not the sign bit's index (57):
++            // with 57 every entry decoded as 0 and every guest access left the JIT for the slow callbacks.
++            // (Same fix as ProsperoEden.)
++            config.page_table_sign_extension = std::uint8_t(std::countl_zero(Common::PageTable::ATTRIBUTE_MASK));
+         }
+     }
+ 
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index c86b2ef..bdecb88 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -235,7 +235,11 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+             Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize()) < (1ULL << 39)) {
+             // Systems like FreeBSD allocate memory really low by default, and since we pack our page table entries,
+             // we have to manually sign extend when our actual pointer is negative.
+-            config.page_table_sign_extension = Common::PageTable::SIGN_BIT;
++            // The emitter does shl/sar by this amount after masking the entry with ATTRIBUTE_MASK (pointer
++            // bits 12..55), so it is the count of bits above the pointer (8), not the sign bit's index (57):
++            // with 57 every entry decoded as 0 and every guest access left the JIT for the slow callbacks.
++            // (Same fix as ProsperoEden.)
++            config.page_table_sign_extension = std::uint8_t(std::countl_zero(Common::PageTable::ATTRIBUTE_MASK));
+         }
+     }
+ 
+diff --git a/src/core/hle/kernel/k_memory_manager.h b/src/core/hle/kernel/k_memory_manager.h
+index 2f4ae7f..cada410 100644
+--- a/src/core/hle/kernel/k_memory_manager.h
++++ b/src/core/hle/kernel/k_memory_manager.h
+@@ -6,6 +6,11 @@
+ 
+ #pragma once
+ 
++#ifdef __ORBIS__
++#include "common/orbis_lazy_memory.h"
++#include "core/device_memory.h"
++#endif
++
+ #include <array>
+ #include <tuple>
+ 
+@@ -213,6 +218,11 @@ private:
+         }
+         void Free(KPhysicalAddress addr, size_t num_pages) {
+             m_heap.Free(addr, num_pages);
++#ifdef __ORBIS__
++            // PS4: guest RAM is committed on first touch; give freed pages back to the console.
++            Common::Orbis::OnGuestRamFreed(GetInteger(addr) - Core::DramMemoryMap::Base,
++                                           num_pages * PageSize);
++#endif
+         }
+ 
+         void SetInitialUsedHeapSize(size_t reserved_size) {
+-- 
+2.56.0.windows.1
+

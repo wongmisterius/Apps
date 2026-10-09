@@ -1,0 +1,59 @@
+From 8a3dfd53522ef795f53b52a42b4364da7b6ed663 Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 18:10:11 -0300
+Subject: [PATCH 26/27] PS4: texture-cache audit, history and read-back off by
+ default (cache bug fixed)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/video_core/texture_cache/texture_cache.h | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index bf19a28..87d14d6 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -56,7 +56,11 @@ struct Event {
+ inline Event ring[16384];
+ inline u32 next = 0;
+ inline u32 dumps = 0;
++inline bool recording = false; // test 22: off (see the audit in TickFrame)
+ inline void Record(const char* op, u32 id, u64 gpu, u64 cpu, u64 size, u64 caller, u64 tick) {
++    if (!recording) {
++        return;
++    }
+     ring[next++ % 16384] = {op, id, gpu, cpu, size, u64(pthread_self()), caller, tick};
+ }
+ template <typename LogFn>
+@@ -84,7 +88,7 @@ inline void DumpRecent(u32 count, LogFn&& log) {
+         }
+     }
+ }
+-inline u32 audit_failures = 0;
++inline s32 audit_failures = 3;
+ } // namespace VideoCommon::Ps4History
+ #endif
+ 
+@@ -262,7 +266,9 @@ void TextureCache<P>::TickFrame() {
+     // its map view in each CPU page. The first times one is not, log it with the recent history
+     // of every image, to find the operation that removed it (MK8D: entries vanish between frames
+     // without an unregister of their own).
+-    if (Ps4History::audit_failures < 3) {
++    // Off since test 22: the cache bug was the SDK's 16-bit wmemchr (fixed in test 20) and this
++    // walked every image every frame. Set to 0 to audit again.
++    if (Ps4History::audit_failures < 0) {
+         for (auto it = slot_images.begin(); it != slot_images.end(); ++it) {
+             const auto [id, image] = *it;
+             if (False(image->flags & ImageFlagBits::Registered) ||
+@@ -2361,7 +2367,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
+         gpu_page_table_storage[slot_images[image_id].registered_gpu_map * 2][page].push_back(image_id);
+         Ps4History::Record("gpu_page+", image_id.index, page << YUZU_PAGEBITS,
+                            slot_images[image_id].registered_gpu_map, 0, 0, frame_tick);
+-        {
++        if (Ps4History::recording) {
+             // Read it straight back: is the entry lost at once (the container) or later?
+             auto& table = gpu_page_table_storage[slot_images[image_id].registered_gpu_map * 2];
+             const auto found = table.find(page);
+-- 
+2.56.0.windows.1
+

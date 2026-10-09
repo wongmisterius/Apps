@@ -1,0 +1,185 @@
+From 78151c96bd9463bc4a0a30cc61c0c5bdc3f1933e Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 10:23:26 -0300
+Subject: [PATCH 19/27] PS4: R8G8 sampling self-test with a red/green
+ workaround (MK8D video chroma came out U/V swapped)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../renderer_vulkan/vk_texture_cache.cpp      | 139 ++++++++++++++++++
+ 1 file changed, 139 insertions(+)
+
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 6c1bf1a..0097617 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -62,6 +62,12 @@ namespace Vulkan {
+ int ps4_bgra_mode = 0;
+ // Sampled B8G8R8A8 views become A8B8G8R8 views with red and blue swapped in the component mapping.
+ bool ps4_bgra_swap = false;
++// MK8D's videos: VIC's YUV frame is right (checked on the PC, test 14) and the game converts it
++// in a shader that reads chroma from an R8G8 texture (U in R, V in G); the screen showed exactly
++// U and V swapped. 0 = decide by the startup self-test, 1 = always swap, 2 = never.
++int ps4_rg_mode = 0;
++// Sampled R8G8 views get red and green swapped in the component mapping.
++bool ps4_rg_swap = false;
+ // Component mappings, measured at startup (Ps4SwizzleSelfTest): for each permutation of R,G,B,A
+ // that a guest view asks for on an 8-bit RGBA image, the mapping to hand the driver instead so
+ // that it samples what was asked. Empty when the driver applies every permutation correctly.
+@@ -1167,6 +1173,130 @@ bool Ps4BgraSelfTest(const Device& device, MemoryAllocator& allocator) {
+     return sample_swaps;
+ }
+ 
++/// Uploads texels with R=11 G=22 to an R8G8_UNORM image, blits it into an A8B8G8R8 one (the blit
++/// samples the source) and reads both back. Returns true if red and green arrive swapped.
++bool Ps4RgSelfTest(const Device& device, MemoryAllocator& allocator) {
++    constexpr u32 SIZE = 4;
++    const auto make_image = [&](VkFormat format, VkImageUsageFlags extra) {
++        return allocator.CreateImage(VkImageCreateInfo{
++            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++            .pNext = nullptr,
++            .flags = 0,
++            .imageType = VK_IMAGE_TYPE_2D,
++            .format = format,
++            .extent = {SIZE, SIZE, 1},
++            .mipLevels = 1,
++            .arrayLayers = 1,
++            .samples = VK_SAMPLE_COUNT_1_BIT,
++            .tiling = VK_IMAGE_TILING_OPTIMAL,
++            .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++                     VK_IMAGE_USAGE_SAMPLED_BIT | extra,
++            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++            .queueFamilyIndexCount = 0,
++            .pQueueFamilyIndices = nullptr,
++            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++        });
++    };
++    const auto make_buffer = [&](VkDeviceSize size, MemoryUsage usage) {
++        return allocator.CreateBuffer(
++            VkBufferCreateInfo{
++                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++                .pNext = nullptr,
++                .flags = 0,
++                .size = size,
++                .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++                .queueFamilyIndexCount = 0,
++                .pQueueFamilyIndices = nullptr,
++            },
++            usage);
++    };
++    vk::Image rg = make_image(VK_FORMAT_R8G8_UNORM, 0);
++    vk::Image rgba = make_image(VK_FORMAT_A8B8G8R8_UNORM_PACK32,
++                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
++    vk::Buffer upload = make_buffer(SIZE * SIZE * 2, MemoryUsage::Upload);
++    vk::Buffer download = make_buffer(SIZE * SIZE * 2 + SIZE * SIZE * 4, MemoryUsage::Download);
++    {
++        auto bytes = upload.Mapped();
++        for (size_t i = 0; i < SIZE * SIZE * 2; ++i) {
++            bytes[i] = (i % 2) == 0 ? 0x11 : 0x22;
++        }
++        upload.Flush();
++    }
++    const VkImage rg_handle = *rg;
++    const VkImage rgba_handle = *rgba;
++    const VkBuffer upload_handle = *upload;
++    const VkBuffer download_handle = *download;
++    const bool done = Ps4RunOnce(device, [&](vk::CommandBuffer cmdbuf) {
++        const auto barrier = [](VkImage image, VkImageLayout from, VkImageLayout to) {
++            return VkImageMemoryBarrier{
++                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++                .pNext = nullptr,
++                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
++                .oldLayout = from,
++                .newLayout = to,
++                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .image = image,
++                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
++            };
++        };
++        constexpr auto UNDEF = VK_IMAGE_LAYOUT_UNDEFINED;
++        constexpr auto DST = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++        constexpr auto SRC = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++        const std::array to_dst{barrier(rg_handle, UNDEF, DST), barrier(rgba_handle, UNDEF, DST)};
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
++                               nullptr, nullptr, to_dst);
++        VkBufferImageCopy region{
++            .bufferOffset = 0,
++            .bufferRowLength = 0,
++            .bufferImageHeight = 0,
++            .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++            .imageOffset = {0, 0, 0},
++            .imageExtent = {SIZE, SIZE, 1},
++        };
++        cmdbuf.CopyBufferToImage(upload_handle, rg_handle, DST, region);
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
++                               nullptr, nullptr, barrier(rg_handle, DST, SRC));
++        const VkImageBlit blit{
++            .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++            .srcOffsets = {{0, 0, 0}, {s32(SIZE), s32(SIZE), 1}},
++            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++            .dstOffsets = {{0, 0, 0}, {s32(SIZE), s32(SIZE), 1}},
++        };
++        cmdbuf.BlitImage(rg_handle, SRC, rgba_handle, DST, blit, VK_FILTER_NEAREST);
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
++                               nullptr, nullptr, barrier(rgba_handle, DST, SRC));
++        cmdbuf.CopyImageToBuffer(rg_handle, SRC, download_handle, region);
++        region.bufferOffset = SIZE * SIZE * 2;
++        cmdbuf.CopyImageToBuffer(rgba_handle, SRC, download_handle, region);
++        const VkMemoryBarrier to_host{
++            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
++        };
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
++                               to_host);
++    });
++    if (!done) {
++        LOG_ERROR(Render_Vulkan, "PS4 R8G8 self-test: the submission did not complete");
++        return false;
++    }
++    download.Invalidate();
++    const auto bytes = download.Mapped();
++    const u8* raw = bytes.data();
++    const u8* sampled = bytes.data() + SIZE * SIZE * 2;
++    const bool swaps = sampled[0] == 0x22 && sampled[1] == 0x11;
++    LOG_WARNING(Render_Vulkan,
++                "PS4 R8G8 self-test: copy {:02x} {:02x} (ok 11 22), R8G8->RGBA blit {:02x} {:02x} "
++                "{:02x} {:02x} (ok 11 22 00 ff) -> sampling R8G8 {}",
++                raw[0], raw[1], sampled[0], sampled[1], sampled[2], sampled[3],
++                swaps ? "SWAPS red/green" : "is correct");
++    return swaps;
++}
++
+ /// Samples one known RGBA8 texel (11 22 33 44) through all 24 permutations of R,G,B,A as
+ /// VkComponentMapping, plus a few other mappings and a B8G8R8A8 image, with a compute shader,
+ /// and compares against what Vulkan defines. MK8D's videos read their frames with (G,B,A,R) and
+@@ -1565,6 +1695,10 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
+                         (ps4_bgra_mode == 1 || (ps4_bgra_mode == 0 && swaps));
+         LOG_WARNING(Render_Vulkan, "PS4 BGRA workaround {} (mode {})",
+                     ps4_bgra_swap ? "ON" : "off", ps4_bgra_mode);
++        const bool rg_swaps = ps4_rg_mode == 0 && Ps4RgSelfTest(device, memory_allocator);
++        ps4_rg_swap = ps4_rg_mode == 1 || rg_swaps;
++        LOG_WARNING(Render_Vulkan, "PS4 R8G8 workaround {} (mode {})", ps4_rg_swap ? "ON" : "off",
++                    ps4_rg_mode);
+         if (ps4_swizzle_mode == 0) {
+             Ps4SwizzleSelfTest(device, memory_allocator);
+         }
+@@ -3156,6 +3290,11 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
+                                  : VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+         std::ranges::transform(swizzle, swizzle.begin(), SwapBlueRed);
+     }
++    if (ps4_rg_swap && !info.IsRenderTarget() &&
++        (format_info.format == VK_FORMAT_R8G8_UNORM || format_info.format == VK_FORMAT_R8G8_SNORM ||
++         format_info.format == VK_FORMAT_R8G8_UINT || format_info.format == VK_FORMAT_R8G8_SINT)) {
++        std::ranges::transform(swizzle, swizzle.begin(), SwapGreenRed);
++    }
+ #endif
+     if (device->ApiVersion() >= VK_API_VERSION_1_3) {
+         const VkFormatProperties3 properties3 =
+-- 
+2.56.0.windows.1
+

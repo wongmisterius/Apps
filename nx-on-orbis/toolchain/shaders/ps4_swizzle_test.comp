@@ -1,0 +1,41 @@
+// eden-ps4: reads texel (0,0) of 32 image views into a buffer, to measure how the PS4 driver
+// applies VkComponentMapping (see Ps4SwizzleSelfTest in vk_texture_cache.cpp).
+#version 450
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) uniform sampler2D views[32];
+layout(set = 0, binding = 1, std430) buffer Out { vec4 texels[32]; };
+void main() {
+    // Constant indices: no dynamic-indexing feature needed.
+    texels[0] = texelFetch(views[0], ivec2(0, 0), 0);
+    texels[1] = texelFetch(views[1], ivec2(0, 0), 0);
+    texels[2] = texelFetch(views[2], ivec2(0, 0), 0);
+    texels[3] = texelFetch(views[3], ivec2(0, 0), 0);
+    texels[4] = texelFetch(views[4], ivec2(0, 0), 0);
+    texels[5] = texelFetch(views[5], ivec2(0, 0), 0);
+    texels[6] = texelFetch(views[6], ivec2(0, 0), 0);
+    texels[7] = texelFetch(views[7], ivec2(0, 0), 0);
+    texels[8] = texelFetch(views[8], ivec2(0, 0), 0);
+    texels[9] = texelFetch(views[9], ivec2(0, 0), 0);
+    texels[10] = texelFetch(views[10], ivec2(0, 0), 0);
+    texels[11] = texelFetch(views[11], ivec2(0, 0), 0);
+    texels[12] = texelFetch(views[12], ivec2(0, 0), 0);
+    texels[13] = texelFetch(views[13], ivec2(0, 0), 0);
+    texels[14] = texelFetch(views[14], ivec2(0, 0), 0);
+    texels[15] = texelFetch(views[15], ivec2(0, 0), 0);
+    texels[16] = texelFetch(views[16], ivec2(0, 0), 0);
+    texels[17] = texelFetch(views[17], ivec2(0, 0), 0);
+    texels[18] = texelFetch(views[18], ivec2(0, 0), 0);
+    texels[19] = texelFetch(views[19], ivec2(0, 0), 0);
+    texels[20] = texelFetch(views[20], ivec2(0, 0), 0);
+    texels[21] = texelFetch(views[21], ivec2(0, 0), 0);
+    texels[22] = texelFetch(views[22], ivec2(0, 0), 0);
+    texels[23] = texelFetch(views[23], ivec2(0, 0), 0);
+    texels[24] = texelFetch(views[24], ivec2(0, 0), 0);
+    texels[25] = texelFetch(views[25], ivec2(0, 0), 0);
+    texels[26] = texelFetch(views[26], ivec2(0, 0), 0);
+    texels[27] = texelFetch(views[27], ivec2(0, 0), 0);
+    texels[28] = texelFetch(views[28], ivec2(0, 0), 0);
+    texels[29] = texelFetch(views[29], ivec2(0, 0), 0);
+    texels[30] = texelFetch(views[30], ivec2(0, 0), 0);
+    texels[31] = texelFetch(views[31], ivec2(0, 0), 0);
+}

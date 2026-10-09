@@ -1,0 +1,83 @@
+From 79b11c7a2a63ebed65d207bf51b381ed61d2af35 Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 10:11:34 -0300
+Subject: [PATCH 12/27] PS4: log new pipelines' stages and each distinct
+ sampled view setup
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../renderer_vulkan/vk_pipeline_cache.cpp     | 11 ++++++++++
+ .../renderer_vulkan/vk_texture_cache.cpp      | 21 +++++++++++++++++++
+ 2 files changed, 32 insertions(+)
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 642b9fa..b45a6dd 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -791,6 +791,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+     bool build_in_parallel) try {
+     auto hash = key.Hash();
+     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
++#ifdef __ORBIS__
++    // Which stages each new pipeline has: geometry and tessellation are the PS4 driver's weak
++    // spots (GS rings, tess rings), so a device loss can be matched to what was being built.
++    LOG_INFO(Render_Vulkan, "PS4 pipeline {:016x}: vsA={} vsB={} tcs={} tes={} gs={} fs={} topology={}",
++             hash, key.unique_hashes[0] != 0, key.unique_hashes[1] != 0, key.unique_hashes[2] != 0,
++             key.unique_hashes[3] != 0, key.unique_hashes[4] != 0, key.unique_hashes[5] != 0,
++             u32(key.state.topology.Value()));
++#endif
+     size_t env_index{0};
+     std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
+     const bool uses_vertex_a{key.unique_hashes[0] != 0};
+@@ -806,6 +814,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+             auto topology = MaxwellToOutputTopology(key.state.topology);
+             programs[index] = GenerateGeometryPassthrough(pools.inst, pools.block, host_info,
+                                                           *layer_source_program, topology);
++#ifdef __ORBIS__
++            LOG_INFO(Render_Vulkan, "PS4 pipeline {:016x}: emulated layer GS passthrough", hash);
++#endif
+             continue;
+         }
+         if (key.unique_hashes[index] == 0) {
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index d037185..548245a 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -10,6 +10,7 @@
+ #include <optional>
+ #include <span>
+ #include <memory>
++#include <mutex>
+ #include <utility>
+ #include <vector>
+ #include <boost/container/small_vector.hpp>
+@@ -2761,6 +2762,26 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
+              VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT) != 0;
+     }
+     requires_border_color_format = NeedsExplicitBorderColorFormat(format_info.format);
++#ifdef __ORBIS__
++    {
++        // Each distinct sampled-view setup once, to find what MK8D's red/blue-swapped images
++        // (videos, the kart-screen character) have in common.
++        static std::mutex seen_mutex;
++        static std::vector<u64> seen;
++        const u64 id = u64(format) | u64(format_info.format) << 16 | u64(swizzle[0]) << 40 |
++                       u64(swizzle[1]) << 44 | u64(swizzle[2]) << 48 | u64(swizzle[3]) << 52 |
++                       u64(info.IsRenderTarget()) << 56 | u64(image.info.format) << 57;
++        std::scoped_lock lock{seen_mutex};
++        if (std::find(seen.begin(), seen.end(), id) == seen.end()) {
++            seen.push_back(id);
++            LOG_INFO(Render_Vulkan,
++                     "PS4 view: guest {} on image {} -> vk {} swizzle {},{},{},{} rt={} {}x{}",
++                     u32(format), u32(image.info.format), u32(format_info.format),
++                     u32(swizzle[0]), u32(swizzle[1]), u32(swizzle[2]), u32(swizzle[3]),
++                     info.IsRenderTarget(), image.info.size.width, image.info.size.height);
++        }
++    }
++#endif
+     swizzle_mapping = VkComponentMapping{
+         .r = ComponentSwizzle(swizzle[0]),
+         .g = ComponentSwizzle(swizzle[1]),
+-- 
+2.56.0.windows.1
+

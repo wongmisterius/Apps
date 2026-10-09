@@ -1,0 +1,123 @@
+From 3958dbe9f5241a1b736f0957e750dacabfc322e5 Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 10:21:26 -0300
+Subject: [PATCH 18/27] PS4: trace texture-cache inconsistencies to boot.log;
+ never create a view of a deleted image
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../renderer_vulkan/vk_texture_cache.cpp      | 23 +++++++++++++++
+ src/video_core/texture_cache/texture_cache.h  | 28 +++++++++++++++++++
+ 2 files changed, 51 insertions(+)
+
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 3bac222..6c1bf1a 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -41,6 +41,19 @@
+ #include "video_core/renderer_vulkan/ps4_swizzle_test_spv.h"
+ #endif
+ 
++#if defined(__ORBIS__) && !defined(PS4_TC_TRACE)
++// See texture_cache.h: caller chains of texture-cache inconsistencies, logged by the frontend.
++extern "C" void EdenPs4Backtrace(const char* why, unsigned long long a, unsigned long long b,
++                                 unsigned long long c, unsigned long long d)
++    __attribute__((weak));
++#define PS4_TC_TRACE(why, a, b, c, d)                                                             \
++    do {                                                                                          \
++        if (EdenPs4Backtrace) {                                                                   \
++            EdenPs4Backtrace(why, u64(a), u64(b), u64(c), u64(d));                                \
++        }                                                                                         \
++    } while (0)
++#endif
++
+ namespace Vulkan {
+ 
+ #ifdef __ORBIS__
+@@ -3243,6 +3256,16 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
+         .components = swizzle_mapping,
+         .subresourceRange = MakeSubresourceRange(aspect_mask, info.range),
+     };
++#ifdef __ORBIS__
++    if (image.Handle() == VK_NULL_HANDLE) {
++        // The image was already deleted (its object moved into the destruction ring) but the
++        // texture cache still hands out its id. Creating a view of VK_NULL_HANDLE crashed inside
++        // RADV (test 15, vk_image_view_init): leave this view empty instead.
++        PS4_TC_TRACE("view requested of a deleted image (image id, gpu, format, 0)",
++                     image_id_.index, image.gpu_addr, u32(info.format), 0);
++        return;
++    }
++#endif
+     const auto create = [&](TextureType tex_type, std::optional<u32> num_layers) {
+         VkImageViewCreateInfo ci{create_info};
+         ci.viewType = ImageViewType(tex_type);
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 54a9ed9..b3c57f7 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -26,6 +26,20 @@
+ #include "video_core/texture_cache/util.h"
+ #include "video_core/textures/decoders.h"
+ 
++#ifdef __ORBIS__
++// eden-ps4: the frontend logs the caller chain (frame-pointer walk) of the first texture-cache
++// inconsistencies to boot.log, to find which path leaves the cache inconsistent (MK8D).
++extern "C" void EdenPs4Backtrace(const char* why, unsigned long long a, unsigned long long b,
++                                 unsigned long long c, unsigned long long d)
++    __attribute__((weak));
++#define PS4_TC_TRACE(why, a, b, c, d)                                                             \
++    do {                                                                                          \
++        if (EdenPs4Backtrace) {                                                                   \
++            EdenPs4Backtrace(why, u64(a), u64(b), u64(c), u64(d));                                \
++        }                                                                                         \
++    } while (0)
++#endif
++
+ namespace VideoCommon {
+ 
+ using Tegra::Texture::TICEntry;
+@@ -2230,6 +2244,8 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
+     // Unregistering twice frees the image's LRU slot twice; two images then share it and the LRU
+     // list corrupts (MK8D crashed in LeastRecentlyUsedCache::Free). Its pages are already gone.
+     if (False(image.flags & ImageFlagBits::Registered)) {
++        PS4_TC_TRACE("unregister of an unregistered image (id, gpu, cpu, size)", image_id.index,
++                     image.gpu_addr, image.cpu_addr, image.guest_size_bytes);
+         return;
+     }
+     if (image.registered_gpu_map >= gpu_page_table_storage.size() / 2) {
+@@ -2262,6 +2278,10 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
+             if (vector_it == image_ids.end()) {
+                 ASSERT_MSG(false, "Unregistering unregistered image in page={:#x}",
+                            page << YUZU_PAGEBITS);
++#ifdef __ORBIS__
++                PS4_TC_TRACE("registered image missing from a GPU page (id, page, entries, 0)",
++                             image_id.index, page << YUZU_PAGEBITS, image_ids.size(), 0);
++#endif
+                 return;
+             }
+             image_ids.erase(vector_it);
+@@ -2286,6 +2306,10 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
+             if (vector_it == image_map_ids.end()) {
+                 ASSERT_MSG(false, "Unregistering unregistered image in page={:#x}",
+                            page << YUZU_PAGEBITS);
++#ifdef __ORBIS__
++                PS4_TC_TRACE("registered image missing from a CPU page (map, page, entries, 0)",
++                             map_id.index, page << YUZU_PAGEBITS, image_map_ids.size(), 0);
++#endif
+                 return;
+             }
+             image_map_ids.erase(vector_it);
+@@ -2395,6 +2419,10 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+     if (alloc_it == image_allocs_table.end()) {
+         ASSERT_MSG(false, "Trying to delete an image alloc that does not exist in address {:#x}",
+                    gpu_addr);
++#ifdef __ORBIS__
++        PS4_TC_TRACE("delete of an image with no alloc (id, gpu, cpu, flags)", image_id.index,
++                     gpu_addr, image.cpu_addr, u32(image.flags));
++#endif
+         return;
+     }
+     const ImageAllocId alloc_id = alloc_it->second;
+-- 
+2.56.0.windows.1
+

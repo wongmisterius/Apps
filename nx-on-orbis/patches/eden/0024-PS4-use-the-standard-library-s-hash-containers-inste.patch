@@ -1,0 +1,73 @@
+From 0890843837ddc4def548f5e76ca507b880e69d7d Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 17:07:04 -0300
+Subject: [PATCH 24/27] PS4: use the standard library's hash containers instead
+ of boost::unordered_flat_* (page-table entries went missing on the console)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/common/container/unordered_map.h | 13 +++++++++++++
+ src/common/container/unordered_set.h | 11 +++++++++++
+ 2 files changed, 24 insertions(+)
+
+diff --git a/src/common/container/unordered_map.h b/src/common/container/unordered_map.h
+index 7d9e49f..8d4d611 100644
+--- a/src/common/container/unordered_map.h
++++ b/src/common/container/unordered_map.h
+@@ -5,12 +5,25 @@
+ 
+ #include "common/container_hash.h"
+ 
++#ifdef __ORBIS__
++// eden-ps4 (test 19): the texture cache's page tables lost entries on the PS4 right after they
++// were inserted; use the standard library's container there. tests/flat_map_check.cpp still
++// checks boost's at startup.
++#include <unordered_map>
++#else
+ #include <boost/unordered/unordered_flat_map.hpp>
++#endif
+ 
+ namespace Common {
+ 
++#ifdef __ORBIS__
++template <class Key, class T, class Hash = std::hash<Key>, class Pred = std::equal_to<Key>,
++          class Allocator = std::allocator<std::pair<const Key, T>>>
++using unordered_map = std::unordered_map<Key, T, Hash, Pred, Allocator>;
++#else
+ template <class Key, class T, class Hash = std::hash<Key>, class Pred = std::equal_to<Key>,
+           class Allocator = std::allocator<std::pair<const Key, T>>>
+ using unordered_map = boost::unordered::unordered_flat_map<Key, T, Hash, Pred, Allocator>;
++#endif
+ 
+ }
+diff --git a/src/common/container/unordered_set.h b/src/common/container/unordered_set.h
+index 54d7140..fa43d62 100644
+--- a/src/common/container/unordered_set.h
++++ b/src/common/container/unordered_set.h
+@@ -5,12 +5,23 @@
+ 
+ #include "common/container_hash.h"
+ 
++#ifdef __ORBIS__
++// eden-ps4 (test 19): see unordered_map.h.
++#include <unordered_set>
++#else
+ #include <boost/unordered/unordered_flat_set.hpp>
++#endif
+ 
+ namespace Common {
+ 
++#ifdef __ORBIS__
++template <class Key, class Hash = std::hash<Key>, class Pred = std::equal_to<Key>,
++          class Allocator = std::allocator<Key>>
++using unordered_set = std::unordered_set<Key, Hash, Pred, Allocator>;
++#else
+ template <class Key, class Hash = std::hash<Key>, class Pred = std::equal_to<Key>,
+           class Allocator = std::allocator<Key>>
+ using unordered_set = boost::unordered::unordered_flat_set<Key, Hash, Pred, Allocator>;
++#endif
+ 
+ }
+-- 
+2.56.0.windows.1
+

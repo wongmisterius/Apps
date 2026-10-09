@@ -1,0 +1,104 @@
+From 516f7e73a516a1e11feee545c1367112406ccad7 Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 12:40:11 -0300
+Subject: [PATCH 15/27] PS4: submit smaller command buffers (the driver
+ flattens each submission into 2 MiB)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/video_core/renderer_vulkan/vk_buffer_cache.cpp  |  5 +++++
+ src/video_core/renderer_vulkan/vk_rasterizer.cpp    | 13 ++++++++++++-
+ src/video_core/renderer_vulkan/vk_scheduler.cpp     |  3 +++
+ src/video_core/renderer_vulkan/vk_scheduler.h       |  7 +++++++
+ src/video_core/renderer_vulkan/vk_texture_cache.cpp |  3 +++
+ 5 files changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+index 958f3b2..5e794ed 100644
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+@@ -452,6 +452,11 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
+     if (dst_buffer == VK_NULL_HANDLE || src_buffer == VK_NULL_HANDLE) {
+         return;
+     }
++#ifdef __ORBIS__
++    // Counted with the texture uploads (see Scheduler::ps4_uploads_since_submit): a region is a
++    // few dwords, so 16 of them weigh about one texture upload.
++    scheduler.ps4_uploads_since_submit += u32((copies.size() + 15) / 16);
++#endif
+     static constexpr VkMemoryBarrier READ_BARRIER{
+         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+         .pNext = nullptr,
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index f43bea1..df39f4c 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -981,7 +981,18 @@ void RasterizerVulkan::LoadDiskResources(u64 title_id, std::stop_token stop_load
+ }
+ 
+ void RasterizerVulkan::FlushWork() {
+-#ifdef __ANDROID__
++#ifdef __ORBIS__
++    // The PS4 driver cannot submit more than 2 MiB of commands at once (it loses the device);
++    // GFX7 emits more state per draw than newer GPUs, and texture uploads are meta draws there.
++    static constexpr u32 DRAWS_TO_DISPATCH = 256;
++    static constexpr u32 CHECK_MASK = 3;
++    static constexpr u32 UPLOADS_TO_DISPATCH = 96;
++    if (scheduler.ps4_uploads_since_submit >= UPLOADS_TO_DISPATCH) {
++        scheduler.Flush();
++        draw_counter = 0;
++        return;
++    }
++#elif defined(__ANDROID__)
+     static constexpr u32 DRAWS_TO_DISPATCH = 512;
+     static constexpr u32 CHECK_MASK = 3;
+ #else
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 4a7a7d5..a2c4592 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -386,6 +386,9 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
+ 
+ void Scheduler::AllocateNewContext() {
+     // Enable counters once again. These are disabled when a command buffer is finished.
++#ifdef __ORBIS__
++    ps4_uploads_since_submit = 0;
++#endif
+ }
+ 
+ void Scheduler::InvalidateState() {
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index d4bc8d0..2d5f727 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -171,6 +171,13 @@ public:
+ 
+     std::mutex submit_mutex;
+ 
++#ifdef __ORBIS__
++    /// Texture uploads recorded since the last submission. The PS4 driver flattens a whole
++    /// submission into a 2 MiB (524288 dword) staging buffer and loses the device when one does
++    /// not fit (MK8D's race load); the rasterizer flushes early when this grows.
++    u32 ps4_uploads_since_submit{};
++#endif
++
+ private:
+     class Command {
+     public:
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index d0f9c57..15dd508 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -2582,6 +2582,9 @@ void Image::AllocateComputeUnswizzleBuffer(u32 max_slices) {
+ 
+ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
+                          std::span<const VideoCommon::BufferImageCopy> copies) {
++#ifdef __ORBIS__
++    scheduler->ps4_uploads_since_submit += u32(copies.size());
++#endif
+     // TODO: Move this to another API
+     if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
+         runtime->InvalidateResolveShadow(Handle());
+-- 
+2.56.0.windows.1
+

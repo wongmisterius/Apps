@@ -1,0 +1,16 @@
+# Built or downloaded locally, never committed (see docs/BUILDING.md)
+deps/
+ref/
+sdk-dl/
+libcxx18/
+prefix/
+tools/usr/
+tools/msys-perl/
+tools/bin/
+tools/*.zst
+build-*/
+stage-*/
+out/
+out-eden/
+elf/
+*.log

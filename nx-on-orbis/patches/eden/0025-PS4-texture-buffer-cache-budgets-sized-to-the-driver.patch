@@ -1,0 +1,129 @@
+From e27f0f5e1203dc17c1355523e7461897a91ca65a Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 17:47:30 -0300
+Subject: [PATCH 25/27] PS4: texture/buffer cache budgets sized to the driver's
+ GPU arena; collect mid-frame when past the aggressive threshold
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/video_core/buffer_cache/buffer_cache.h   | 19 +++++++++
+ src/video_core/texture_cache/texture_cache.h | 45 ++++++++++++++++++++
+ 2 files changed, 64 insertions(+)
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 4c345dd..9f84064 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -6,6 +6,8 @@
+ 
+ #pragma once
+ 
++#include <cstdlib>
++
+ #include <algorithm>
+ #include <memory>
+ #include <numeric>
+@@ -33,6 +35,13 @@ BufferCache<P>::BufferCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, R
+     if (!runtime.CanReportMemoryUsage()) {
+         minimum_memory = DEFAULT_EXPECTED_MEMORY;
+         critical_memory = DEFAULT_CRITICAL_MEMORY;
++#ifdef __ORBIS__
++        const char* value = std::getenv("ORBIS_ARENA_MIB");
++        const long mib = value != nullptr ? std::strtol(value, nullptr, 10) : 0;
++        const s64 arena = static_cast<s64>(mib > 0 ? mib : 1024) * 1024 * 1024;
++        minimum_memory = static_cast<u64>(arena * 60 / 100);
++        critical_memory = static_cast<u64>(arena * 75 / 100);
++#endif
+         return;
+     }
+ 
+@@ -48,6 +57,16 @@ BufferCache<P>::BufferCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, R
+     critical_memory = static_cast<u64>(
+         (std::max)((std::min)(device_local_memory - min_vacancy_critical, min_spacing_critical),
+                  DEFAULT_CRITICAL_MEMORY));
++#ifdef __ORBIS__
++    {
++        // See Ps4GpuArenaBytes (texture_cache.h): Eden's PC floors exceed the PS4 driver's arena.
++        const char* value = std::getenv("ORBIS_ARENA_MIB");
++        const long mib = value != nullptr ? std::strtol(value, nullptr, 10) : 0;
++        const s64 arena = static_cast<s64>(mib > 0 ? mib : 1024) * 1024 * 1024;
++        minimum_memory = static_cast<u64>(arena * 60 / 100);
++        critical_memory = static_cast<u64>(arena * 75 / 100);
++    }
++#endif
+ }
+ 
+ template <class P>
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 20cee6a..bf19a28 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -88,6 +88,21 @@ inline u32 audit_failures = 0;
+ } // namespace VideoCommon::Ps4History
+ #endif
+ 
++
++#ifdef __ORBIS__
++#include <cstdlib>
++namespace VideoCommon {
++/// The PS4 driver's GPU memory arena (ORBIS_ARENA_MIB, set by the frontend before Vulkan starts):
++/// every image, buffer and shader lives in it, and Eden's PC thresholds (1.1 GiB before the texture
++/// cache even starts collecting) are above it. MK8D's race load ran it out of space.
++inline s64 Ps4GpuArenaBytes() {
++    const char* value = std::getenv("ORBIS_ARENA_MIB");
++    const long mib = value != nullptr ? std::strtol(value, nullptr, 10) : 0;
++    return static_cast<s64>(mib > 0 ? mib : 1024) * 1024 * 1024;
++}
++} // namespace VideoCommon
++#endif
++
+ namespace VideoCommon {
+ 
+ using Tegra::Texture::TICEntry;
+@@ -138,6 +153,17 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
+         critical_memory = DEFAULT_CRITICAL_MEMORY + 1_GiB;
+         minimum_memory = 0;
+     }
++#ifdef __ORBIS__
++    {
++        const s64 arena = Ps4GpuArenaBytes();
++        minimum_memory = static_cast<u64>(arena * 55 / 100);
++        expected_memory = static_cast<u64>(arena * 65 / 100);
++        critical_memory = static_cast<u64>(arena * 75 / 100);
++        LOG_INFO(Render_Vulkan, "PS4 texture cache budget: arena {} MiB, collect from {} MiB, "
++                 "high priority {} MiB, aggressive {} MiB", arena >> 20, minimum_memory >> 20,
++                 expected_memory >> 20, critical_memory >> 20);
++    }
++#endif
+ 
+     const bool gpu_unswizzle_enabled = Settings::values.gpu_unswizzle_enabled.GetValue();
+ 
+@@ -1653,6 +1679,25 @@ bool TextureCache<P>::ScaleDown(Image& image) {
+ template <class P>
+ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
+                                      RelaxedOptions options) {
++#ifdef __ORBIS__
++    // A race load is one long frame and TickFrame (where the collector runs) does not come; the
++    // PS4 driver's arena ran out in the middle of it. Every 16 new images, collect if usage is
++    // past the aggressive threshold (old, untouched images only; current ones are protected).
++    {
++        static u32 ps4_inserts = 0;
++        if ((++ps4_inserts & 15) == 0 && runtime.CanReportMemoryUsage()) {
++            total_used_memory = runtime.GetDeviceMemoryUsage();
++            if (total_used_memory >= critical_memory) {
++                static u32 ps4_midframe_logs = 0;
++                if (ps4_midframe_logs++ < 8) {
++                    LOG_WARNING(Render_Vulkan, "PS4 texture cache: {} MiB in use mid-frame, collecting",
++                                total_used_memory >> 20);
++                }
++                RunGarbageCollector();
++            }
++        }
++    }
++#endif
+     std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+     if (!cpu_addr) {
+         const auto size = CalculateGuestSizeInBytes(info);
+-- 
+2.56.0.windows.1
+

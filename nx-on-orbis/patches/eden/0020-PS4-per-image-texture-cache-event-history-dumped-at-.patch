@@ -1,0 +1,144 @@
+From 0df5d4b7d82623555cf698ed657abd60c3d071b3 Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 12:32:35 -0300
+Subject: [PATCH 20/27] PS4: per-image texture-cache event history dumped at
+ the first inconsistencies; view log keyed by size
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../renderer_vulkan/vk_texture_cache.cpp      |  6 +-
+ src/video_core/texture_cache/texture_cache.h  | 65 +++++++++++++++++++
+ 2 files changed, 69 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 0097617..713fd5b 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -3320,9 +3320,11 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
+         const u64 id = u64(format) | u64(format_info.format) << 16 | u64(swizzle[0]) << 40 |
+                        u64(swizzle[1]) << 44 | u64(swizzle[2]) << 48 | u64(swizzle[3]) << 52 |
+                        u64(info.IsRenderTarget()) << 56 | u64(image.info.format) << 57;
++        // The size too (test 17): the video's planes share format and swizzle with UI textures.
++        const u64 size_key = u64(image.info.size.width) << 16 | u64(image.info.size.height);
+         std::scoped_lock lock{seen_mutex};
+-        if (std::find(seen.begin(), seen.end(), id) == seen.end()) {
+-            seen.push_back(id);
++        if (seen.size() < 600 && std::find(seen.begin(), seen.end(), id ^ (size_key * 0x9E3779B97F4A7C15ull)) == seen.end()) {
++            seen.push_back(id ^ (size_key * 0x9E3779B97F4A7C15ull));
+             LOG_INFO(Render_Vulkan,
+                      "PS4 view: guest {} on image {} -> vk {} swizzle {},{},{},{} rt={} {}x{}",
+                      u32(format), u32(image.info.format), u32(format_info.format),
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index b3c57f7..d647bad 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -38,6 +38,41 @@ extern "C" void EdenPs4Backtrace(const char* why, unsigned long long a, unsigned
+             EdenPs4Backtrace(why, u64(a), u64(b), u64(c), u64(d));                                \
+         }                                                                                         \
+     } while (0)
++#include <pthread.h>
++namespace VideoCommon::Ps4History {
++// Last texture-cache events per image (register / unregister / delete), with thread and caller,
++// dumped for an image the first times it is found inconsistent. Under the cache mutex.
++struct Event {
++    const char* op;
++    u32 id;
++    u64 gpu;
++    u64 cpu;
++    u64 size;
++    u64 thread;
++    u64 caller;
++    u64 tick;
++};
++inline Event ring[4096];
++inline u32 next = 0;
++inline u32 dumps = 0;
++inline void Record(const char* op, u32 id, u64 gpu, u64 cpu, u64 size, u64 caller, u64 tick) {
++    ring[next++ % 4096] = {op, id, gpu, cpu, size, u64(pthread_self()), caller, tick};
++}
++template <typename LogFn>
++inline void Dump(u32 id, LogFn&& log) {
++    if (dumps >= 6) {
++        return;
++    }
++    ++dumps;
++    const u32 count = next < 4096 ? next : 4096;
++    for (u32 i = 0; i < count; ++i) {
++        const Event& e = ring[(next - count + i) % 4096];
++        if (e.op != nullptr && e.id == id) {
++            log(e);
++        }
++    }
++}
++} // namespace VideoCommon::Ps4History
+ #endif
+ 
+ namespace VideoCommon {
+@@ -2193,6 +2228,12 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
+     image.registered_gpu_map = *registered_gpu_map;
+ #endif
+     image.flags |= ImageFlagBits::Registered;
++#ifdef __ORBIS__
++    Ps4History::Record("register", image_id.index, image.gpu_addr, image.cpu_addr,
++                       image.guest_size_bytes,
++                       u64(reinterpret_cast<std::uintptr_t>(__builtin_return_address(0))),
++                       frame_tick);
++#endif
+     u64 tentative_size = (std::max)(image.guest_size_bytes, image.unswizzled_size_bytes);
+     if ((IsPixelFormatASTC(image.info.format) &&
+          True(image.flags & ImageFlagBits::AcceleratedUpload)) ||
+@@ -2246,6 +2287,12 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
+     if (False(image.flags & ImageFlagBits::Registered)) {
+         PS4_TC_TRACE("unregister of an unregistered image (id, gpu, cpu, size)", image_id.index,
+                      image.gpu_addr, image.cpu_addr, image.guest_size_bytes);
++        Ps4History::Dump(image_id.index, [](const Ps4History::Event& e) {
++            LOG_WARNING(Render_Vulkan,
++                        "PS4 image history id={} {} gpu={:#x} cpu={:#x} size={:#x} thread={:#x} "
++                        "caller=eboot+{:#x} tick={}",
++                        e.id, e.op, e.gpu, e.cpu, e.size, e.thread, e.caller - 0x400000, e.tick);
++        });
+         return;
+     }
+     if (image.registered_gpu_map >= gpu_page_table_storage.size() / 2) {
+@@ -2265,6 +2312,12 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
+ #endif
+     image.flags &= ~ImageFlagBits::Registered;
+     image.flags &= ~ImageFlagBits::BadOverlap;
++#ifdef __ORBIS__
++    Ps4History::Record("unregister", image_id.index, image.gpu_addr, image.cpu_addr,
++                       image.guest_size_bytes,
++                       u64(reinterpret_cast<std::uintptr_t>(__builtin_return_address(0))),
++                       frame_tick);
++#endif
+     lru_cache.Free(image.lru_index);
+     const auto& clear_page_table =
+         [image_id](u64 page, ::Common::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>& selected_page_table) {
+@@ -2281,6 +2334,12 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
+ #ifdef __ORBIS__
+                 PS4_TC_TRACE("registered image missing from a GPU page (id, page, entries, 0)",
+                              image_id.index, page << YUZU_PAGEBITS, image_ids.size(), 0);
++                Ps4History::Dump(image_id.index, [](const Ps4History::Event& e) {
++                    LOG_WARNING(Render_Vulkan,
++                                "PS4 image history id={} {} gpu={:#x} cpu={:#x} size={:#x} thread={:#x} "
++                                "caller=eboot+{:#x} tick={}",
++                                e.id, e.op, e.gpu, e.cpu, e.size, e.thread, e.caller - 0x400000, e.tick);
++                });
+ #endif
+                 return;
+             }
+@@ -2414,6 +2473,12 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+     immediate_delete = false;
+ #endif
+     ImageBase& image = slot_images[image_id];
++#ifdef __ORBIS__
++    Ps4History::Record("delete", image_id.index, image.gpu_addr, image.cpu_addr,
++                       image.guest_size_bytes,
++                       u64(reinterpret_cast<std::uintptr_t>(__builtin_return_address(0))),
++                       frame_tick);
++#endif
+     const GPUVAddr gpu_addr = image.gpu_addr;
+     const auto alloc_it = image_allocs_table.find(gpu_addr);
+     if (alloc_it == image_allocs_table.end()) {
+-- 
+2.56.0.windows.1
+

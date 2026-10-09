@@ -1,0 +1,64 @@
+From 0dd32fc3affcde2c000c258ce769dcca2bb1921b Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 21:13:12 -0300
+Subject: [PATCH 03/27] PS4: 64 MiB JIT caches, generic dynarmic exception
+ handler
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp | 6 +++++-
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp | 6 +++++-
+ src/dynarmic/src/dynarmic/CMakeLists.txt  | 3 ++-
+ 3 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index 80e2b2d..62cd0b5 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -206,7 +206,11 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+     config.enable_cycle_counting = !m_uses_wall_clock;
+ 
+     // Code cache size
+-#if defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
++#if defined(__ORBIS__)
++    // PS4: the code cache is direct memory taken up front, from ~3.4 GiB shared with the guest
++    // RAM; four cores at 512 MiB would take most of it. A smaller cache flushes more often.
++    config.code_cache_size = std::uint32_t(64_MiB);
++#elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
+     config.code_cache_size = std::uint32_t(128_MiB);
+ #else
+     config.code_cache_size = std::uint32_t(512_MiB);
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index 9662bf1..c86b2ef 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -258,7 +258,11 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     config.enable_cycle_counting = !m_uses_wall_clock;
+ 
+     // Code cache size
+-#if defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
++#if defined(__ORBIS__)
++    // PS4: the code cache is direct memory taken up front, from ~3.4 GiB shared with the guest
++    // RAM; four cores at 512 MiB would take most of it. A smaller cache flushes more often.
++    config.code_cache_size = std::uint32_t(64_MiB);
++#elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
+     config.code_cache_size = std::uint32_t(128_MiB);
+ #else
+     config.code_cache_size = std::uint32_t(512_MiB);
+diff --git a/src/dynarmic/src/dynarmic/CMakeLists.txt b/src/dynarmic/src/dynarmic/CMakeLists.txt
+index cc1cbcb..8ba15ea 100644
+--- a/src/dynarmic/src/dynarmic/CMakeLists.txt
++++ b/src/dynarmic/src/dynarmic/CMakeLists.txt
+@@ -363,7 +363,8 @@ elseif (APPLE)
+             backend/exception_handler_macos_mig.c
+         )
+     endif()
+-elseif (UNIX AND NOT HAIKUOS)
++elseif (UNIX AND NOT HAIKUOS AND NOT PS4)
++    # (PS4: faults never reach sigaction there, and the ucontext layout differs; generic below)
+     # Haiku lacks <ucontext.h>
+     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+         target_link_libraries(dynarmic PRIVATE rt)
+-- 
+2.56.0.windows.1
+

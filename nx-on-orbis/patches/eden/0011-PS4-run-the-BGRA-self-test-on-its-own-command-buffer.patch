@@ -1,0 +1,121 @@
+From 56e99455fb3fb9259af0180b5b9ebb5f4eca6fa7 Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 09:43:08 -0300
+Subject: [PATCH 11/27] PS4: run the BGRA self-test on its own command buffer
+ (the scheduler cannot submit yet)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../renderer_vulkan/vk_texture_cache.cpp      | 75 +++++++++++++++++--
+ 1 file changed, 67 insertions(+), 8 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index dd665f1..d037185 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -943,7 +943,7 @@ void BlitScale(Scheduler& scheduler, VkImage src_image, VkImage dst_image, const
+ /// Uploads one known pixel to a B8G8R8A8 and an A8B8G8R8 image, blits each into the other format
+ /// (the blit samples the source and renders the destination) and reads all of them back, to see
+ /// whether this driver swaps red and blue on B8G8R8A8 images. Returns true if sampling one does.
+-bool Ps4BgraSelfTest(const Device& device, Scheduler& scheduler, MemoryAllocator& allocator) {
++bool Ps4BgraSelfTest(const Device& device, MemoryAllocator& allocator) {
+     constexpr u32 SIZE = 4;
+     constexpr VkDeviceSize IMAGE_BYTES = SIZE * SIZE * 4;
+     const auto make_image = [&](VkFormat format) {
+@@ -994,10 +994,9 @@ bool Ps4BgraSelfTest(const Device& device, Scheduler& scheduler, MemoryAllocator
+     }
+     upload.Flush();
+ 
+-    scheduler.RequestOutsideRenderPassOperationContext();
+-    scheduler.Record([bgra_src = *bgra_src, rgba_src = *rgba_src, bgra_dst = *bgra_dst,
+-                      rgba_dst = *rgba_dst, upload = *upload,
+-                      download = *download](vk::CommandBuffer cmdbuf) {
++    const auto record = [bgra_src = *bgra_src, rgba_src = *rgba_src, bgra_dst = *bgra_dst,
++                         rgba_dst = *rgba_dst, upload = *upload,
++                         download = *download](vk::CommandBuffer cmdbuf) {
+         const auto barrier = [](VkImage image, VkImageLayout from, VkImageLayout to) {
+             return VkImageMemoryBarrier{
+                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+@@ -1057,8 +1056,67 @@ bool Ps4BgraSelfTest(const Device& device, Scheduler& scheduler, MemoryAllocator
+         };
+         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                                to_host);
+-    });
+-    scheduler.Finish();
++    };
++    // Its own pool, command buffer and fence: the scheduler cannot submit yet while the
++    // rasterizer is being built (Scheduler::Finish resets the query cache, which is still null).
++    const auto& dld = device.GetDispatchLoader();
++    const VkDevice logical = *device.GetLogical();
++    const VkCommandPoolCreateInfo pool_ci{
++        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++        .pNext = nullptr,
++        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
++        .queueFamilyIndex = device.GetGraphicsFamily(),
++    };
++    VkCommandPool pool{};
++    if (dld.vkCreateCommandPool(logical, &pool_ci, nullptr, &pool) != VK_SUCCESS) {
++        LOG_ERROR(Render_Vulkan, "PS4 BGRA self-test: no command pool");
++        return false;
++    }
++    const VkCommandBufferAllocateInfo alloc_info{
++        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++        .pNext = nullptr,
++        .commandPool = pool,
++        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++        .commandBufferCount = 1,
++    };
++    VkCommandBuffer raw_cmdbuf{};
++    VkFence fence{};
++    const VkFenceCreateInfo fence_ci{
++        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .pNext = nullptr, .flags = 0};
++    bool done = false;
++    if (dld.vkAllocateCommandBuffers(logical, &alloc_info, &raw_cmdbuf) == VK_SUCCESS &&
++        dld.vkCreateFence(logical, &fence_ci, nullptr, &fence) == VK_SUCCESS) {
++        const VkCommandBufferBeginInfo begin{
++            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++            .pNext = nullptr,
++            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
++            .pInheritanceInfo = nullptr,
++        };
++        dld.vkBeginCommandBuffer(raw_cmdbuf, &begin);
++        record(vk::CommandBuffer(raw_cmdbuf, dld));
++        dld.vkEndCommandBuffer(raw_cmdbuf);
++        const VkSubmitInfo submit{
++            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++            .pNext = nullptr,
++            .waitSemaphoreCount = 0,
++            .pWaitSemaphores = nullptr,
++            .pWaitDstStageMask = nullptr,
++            .commandBufferCount = 1,
++            .pCommandBuffers = &raw_cmdbuf,
++            .signalSemaphoreCount = 0,
++            .pSignalSemaphores = nullptr,
++        };
++        done = device.GetGraphicsQueue().Submit(submit, fence) == VK_SUCCESS &&
++               dld.vkWaitForFences(logical, 1, &fence, VK_TRUE, 3'000'000'000ull) == VK_SUCCESS;
++    }
++    if (fence) {
++        dld.vkDestroyFence(logical, fence, nullptr);
++    }
++    dld.vkDestroyCommandPool(logical, pool, nullptr);
++    if (!done) {
++        LOG_ERROR(Render_Vulkan, "PS4 BGRA self-test: the submission did not complete");
++        return false;
++    }
+     download.Invalidate();
+     const auto bytes = download.Mapped();
+     const auto word = [&](size_t slot) {
+@@ -1096,7 +1154,8 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
+ #ifdef __ORBIS__
+     {
+         // The workaround views a B8G8R8A8 image as A8B8G8R8, which needs the format list.
+-        const bool swaps = Ps4BgraSelfTest(device, scheduler, memory_allocator);
++        // bgra=off in settings.txt skips the test too.
++        const bool swaps = ps4_bgra_mode != 2 && Ps4BgraSelfTest(device, memory_allocator);
+         ps4_bgra_swap = device.IsKhrImageFormatListSupported() &&
+                         (ps4_bgra_mode == 1 || (ps4_bgra_mode == 0 && swaps));
+         LOG_WARNING(Render_Vulkan, "PS4 BGRA workaround {} (mode {})",
+-- 
+2.56.0.windows.1
+

@@ -1,0 +1,38 @@
+From 05082f349f9893c358d92197ac676d9184537983 Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 18:38:25 -0300
+Subject: [PATCH 27/27] ORBIS: commit lazy guest memory from the top 2 GiB of
+ direct memory
+
+Scattered 64 KiB chunks fragmented direct memory; the C heap carve-outs need 128 MiB blocks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/common/orbis_lazy_memory.cpp | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/src/common/orbis_lazy_memory.cpp b/src/common/orbis_lazy_memory.cpp
+index 7ec2095..3e585d4 100644
+--- a/src/common/orbis_lazy_memory.cpp
++++ b/src/common/orbis_lazy_memory.cpp
+@@ -86,8 +86,15 @@ bool CommitChunkLocked(Region& r, std::size_t index) {
+         return true;
+     }
+     off_t phys = 0;
+-    if (sceKernelAllocateDirectMemory(0, static_cast<off_t>(sceKernelGetDirectMemorySize()), Chunk,
+-                                      Chunk, WbOnion, &phys) != 0) {
++    // 64 KiB chunks taken first-fit from the bottom ended up scattered over all of direct memory
++    // (test 22: the largest free block fell to 2 MiB in a race), while the C heap's carve-outs
++    // and the GPU arena need 128 MiB and more in one piece. Keep the chunks in the top 2 GiB and
++    // only spill below when that is full.
++    const off_t total = static_cast<off_t>(sceKernelGetDirectMemorySize());
++    const off_t upper = total > off_t{3} << 30 ? total - (off_t{2} << 30) : 0;
++    if (sceKernelAllocateDirectMemory(upper, total, Chunk, Chunk, WbOnion, &phys) != 0 &&
++        (upper == 0 ||
++         sceKernelAllocateDirectMemory(0, total, Chunk, Chunk, WbOnion, &phys) != 0)) {
+         g_failures.fetch_add(1, std::memory_order_relaxed);
+         return false;
+     }
+-- 
+2.56.0.windows.1
+

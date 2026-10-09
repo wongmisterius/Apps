@@ -1,0 +1,77 @@
+From 15226ea42b986256e0b4656b46a66a296418b622 Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 01:41:57 -0300
+Subject: [PATCH 08/27] PS4: 512 KiB fiber stacks (128 KiB rewind), 32 MiB JIT
+ caches
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/common/fiber.cpp                      | 8 ++++++--
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp | 4 ++--
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp | 4 ++--
+ 3 files changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/src/common/fiber.cpp b/src/common/fiber.cpp
+index 984ff5f..f6e902a 100644
+--- a/src/common/fiber.cpp
++++ b/src/common/fiber.cpp
+@@ -14,10 +14,14 @@
+ 
+ namespace Common {
+ 
+-#ifdef __OPENORBIS__
++#if defined(__OPENORBIS__) || defined(__ORBIS__)
++// PS4: every guest thread owns a fiber, and a Unity game runs ~90 of them; at 2 MiB (+2 MiB rewind)
++// they held 372 MiB of the console's memory (eden-ps4 heap census). Upstream's OpenOrbis value.
+ constexpr size_t DEFAULT_STACK_SIZE = 128 * 4096;
++constexpr size_t REWIND_STACK_SIZE = 32 * 4096; // only runs the rewind callback
+ #else
+ constexpr size_t DEFAULT_STACK_SIZE = 512 * 4096;
++constexpr size_t REWIND_STACK_SIZE = DEFAULT_STACK_SIZE;
+ #endif
+ constexpr u32 CANARY_VALUE = 0xDEADBEEF;
+ 
+@@ -26,7 +30,7 @@ struct Fiber::FiberImpl {
+ 
+     u32 canary_1 = CANARY_VALUE;
+     std::array<u8, DEFAULT_STACK_SIZE> stack{};
+-    std::array<u8, DEFAULT_STACK_SIZE> rewind_stack{};
++    std::array<u8, REWIND_STACK_SIZE> rewind_stack{};
+     u32 canary_2 = CANARY_VALUE;
+ 
+     boost::context::detail::fcontext_t context{};
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index 2be6822..02acf57 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -211,9 +211,9 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+ 
+     // Code cache size
+ #if defined(__ORBIS__)
+-    // PS4: the code cache is direct memory taken up front, from ~3.4 GiB shared with the guest
++    // PS4: the code cache is direct memory taken up front (32 MiB since test 5: memory ran out), from ~3.4 GiB shared with the guest
+     // RAM; four cores at 512 MiB would take most of it. A smaller cache flushes more often.
+-    config.code_cache_size = std::uint32_t(64_MiB);
++    config.code_cache_size = std::uint32_t(32_MiB);
+ #elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
+     config.code_cache_size = std::uint32_t(128_MiB);
+ #else
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index bdecb88..6aaf699 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -263,9 +263,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+ 
+     // Code cache size
+ #if defined(__ORBIS__)
+-    // PS4: the code cache is direct memory taken up front, from ~3.4 GiB shared with the guest
++    // PS4: the code cache is direct memory taken up front (32 MiB since test 5: memory ran out), from ~3.4 GiB shared with the guest
+     // RAM; four cores at 512 MiB would take most of it. A smaller cache flushes more often.
+-    config.code_cache_size = std::uint32_t(64_MiB);
++    config.code_cache_size = std::uint32_t(32_MiB);
+ #elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
+     config.code_cache_size = std::uint32_t(128_MiB);
+ #else
+-- 
+2.56.0.windows.1
+

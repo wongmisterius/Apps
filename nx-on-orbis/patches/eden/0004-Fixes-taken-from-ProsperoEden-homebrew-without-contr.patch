@@ -1,0 +1,115 @@
+From f206c03d74c7e36d61b0cb21e75d4218227c8ee9 Mon Sep 17 00:00:00 2001
+From: alechurri <337117637+alechurri@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 22:23:05 -0300
+Subject: [PATCH 04/27] Fixes taken from ProsperoEden: homebrew without control
+ data, shutdown order, failed-load unwind, fibers, per-load program id
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/common/fiber.cpp                            |  5 +++--
+ src/core/core.cpp                               | 17 +++++++++++------
+ .../am/service/application_functions.cpp        |  3 ++-
+ 3 files changed, 16 insertions(+), 9 deletions(-)
+
+diff --git a/src/common/fiber.cpp b/src/common/fiber.cpp
+index 0e7f28c..984ff5f 100644
+--- a/src/common/fiber.cpp
++++ b/src/common/fiber.cpp
+@@ -89,10 +89,11 @@ void Fiber::Exit() {
+ void Fiber::YieldTo(std::weak_ptr<Fiber> weak_from, Fiber& to) {
+     to.impl->guard.lock();
+     to.impl->previous_fiber = weak_from.lock();
++    ASSERT(to.impl->previous_fiber);
++    weak_from.reset(); // an abandoned fiber stack is never unwound (from ProsperoEden)
+ 
+     auto transfer = boost::context::detail::jump_fcontext(to.impl->context, &to);
+-    // "from" might no longer be valid if the thread was killed
+-    if (auto from = weak_from.lock()) {
++    if (auto* from = static_cast<Fiber*>(transfer.data)) {
+         if (from->impl->previous_fiber == nullptr) {
+             ASSERT(false && "previous_fiber is nullptr!");
+         } else {
+diff --git a/src/core/core.cpp b/src/core/core.cpp
+index 054af8d..66555a6 100644
+--- a/src/core/core.cpp
++++ b/src/core/core.cpp
+@@ -326,6 +326,7 @@ struct System::Impl {
+         auto process = Service::AM::CreateApplicationProcess(control, app_loader, load_result, system, file, params.program_id, params.program_index);
+         if (load_result != Loader::ResultStatus::Success) {
+             LOG_CRITICAL(Core, "Failed to load ROM (Error {})!", load_result);
++            process.reset(); // before kernel.Shutdown tears down its mutexes (from ProsperoEden)
+             ShutdownMainProcess();
+             return SystemResultStatus(u32(SystemResultStatus::ErrorLoader) + u32(load_result));
+         }
+@@ -359,6 +360,7 @@ struct System::Impl {
+         SystemResultStatus init_result{SetupForApplicationProcess(system, emu_window)};
+         if (init_result != SystemResultStatus::Success) {
+             LOG_CRITICAL(Core, "Failed to initialize system (Error {})!", int(init_result));
++            process.reset(); // before kernel.Shutdown tears down its mutexes (from ProsperoEden)
+             ShutdownMainProcess();
+             return init_result;
+         }
+@@ -392,11 +394,9 @@ struct System::Impl {
+         auto const metadata = pm.GetControlMetadata();
+         std::string title_version = metadata.first != nullptr ? metadata.first->GetVersionString() : "";
+ 
+-        if (app_loader->ReadProgramId(program_id) != Loader::ResultStatus::Success) {
+-            LOG_ERROR(Core, "Failed to find program id for ROM");
+-        }
+-
+-        GameSettings::LoadOverrides(program_id, gpu_core->Renderer());
++        // Load() already read the ID into params; reading it again into a member left that member
++        // uninitialised for programs without one, such as homebrew (from ProsperoEden).
++        GameSettings::LoadOverrides(params.program_id, gpu_core->Renderer());
+         if (auto room_member = Network::GetRoomMember().lock()) {
+             Network::GameInfo game_info;
+             game_info.name = name;
+@@ -420,10 +420,14 @@ struct System::Impl {
+         if (gpu_core)
+             gpu_core->NotifyShutdown();
+ 
++        // Join audio callbacks before their service-owned targets go (from ProsperoEden)
++        if (audio_core) audio_core->Shutdown();
+         stop_event.request_stop();
+         core_timing.SyncPause(false);
+         Network::CancelPendingSocketOperations();
+         kernel.SuspendEmulation(true);
++        // The cheat engine's timing event reads HID through the services (from ProsperoEden)
++        cheat_engine.reset();
+         kernel.CloseServices();
+         kernel.ShutdownCores();
+         services.reset();
+@@ -470,6 +474,8 @@ struct System::Impl {
+     }
+ 
+     Timing::CoreTiming core_timing;
++    // Kernel lists point into DeviceMemory during a failed Load unwind: declared first, freed last (from ProsperoEden)
++    std::optional<Core::DeviceMemory> device_memory;
+     Kernel::KernelCore kernel;
+     /// RealVfsFilesystem instance
+     FileSys::VirtualFilesystem virtual_filesystem;
+@@ -498,7 +504,6 @@ struct System::Impl {
+     std::optional<Service::Event> general_channel_event;
+     std::optional<Core::PerfStats> perf_stats;
+     std::optional<Tegra::Host1x::Host1x> host1x_core;
+-    std::optional<Core::DeviceMemory> device_memory;
+     std::optional<AudioCore::AudioCore> audio_core;
+     std::optional<Memory::CheatEngine> cheat_engine;
+     std::optional<Tools::Freezer> memory_freezer;
+diff --git a/src/core/hle/service/am/service/application_functions.cpp b/src/core/hle/service/am/service/application_functions.cpp
+index 215d204..966ae61 100644
+--- a/src/core/hle/service/am/service/application_functions.cpp
++++ b/src/core/hle/service/am/service/application_functions.cpp
+@@ -354,7 +354,8 @@ Result IApplicationFunctions::GetPseudoDeviceId(Out<Common::UUID> out_pseudo_dev
+     const auto res = FileSys::PatchManager::GetMetadataFromBaseOrUpdate(system, m_applet->program_id);
+     u8 hash[EVP_MAX_MD_SIZE];
+     unsigned int hash_len = 0;
+-    auto const seed = res.first->raw.seed_for_pseudo_device_id;
++    // No control data (a homebrew NRO): seed 0, as other NACP fields default. (from ProsperoEden)
++    auto const seed = res.first != nullptr ? res.first->raw.seed_for_pseudo_device_id : u64_le{0};
+     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+     auto const algorithm = EVP_sha1();
+     EVP_DigestInit_ex(ctx, algorithm, nullptr);
+-- 
+2.56.0.windows.1
+
