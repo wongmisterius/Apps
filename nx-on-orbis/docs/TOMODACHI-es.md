@@ -27,6 +27,12 @@ piden los reportes para este juego; no hizo falta pasar a otro Eden.
 
 Instalación: igual que [INSTALL.md](INSTALL.md) (FTP en modo binario, Package Installer de GoldHEN).
 
+El `.pkg` de tl1 (57 MiB) se entrega en 3 partes (`.001` a `.003`). Para unirlas:
+
+- Windows (cmd): `copy /b nx-on-orbis-tl1.pkg.001+nx-on-orbis-tl1.pkg.002+nx-on-orbis-tl1.pkg.003 nx-on-orbis-tl1.pkg`
+- Linux/macOS: `cat nx-on-orbis-tl1.pkg.0* > nx-on-orbis-tl1.pkg`
+- SHA256 esperado: ver `releases/tl1/SHA256SUMS` (`certutil -hashfile nx-on-orbis-tl1.pkg SHA256`).
+
 ## Prueba 1: qué mirar y qué mandar
 
 1. Borrá la caché vieja de shaders si venías de v0.1.0 (no es obligatorio).
