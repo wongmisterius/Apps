@@ -13,10 +13,19 @@ DEST="$ROOT/deps/eden"
 [ -e "$DEST" ] && { echo "$DEST exists; remove it first"; exit 1; }
 mkdir -p "$ROOT/deps"
 TAR="$ROOT/deps/eden-${COMMIT:0:8}.tar.gz"
-[ -f "$TAR" ] || curl -L --fail -o "$TAR" "$URL"
-echo "$SHA256  $TAR" | sha256sum -c - || echo "warning: checksum differs from ProsperoEden's (GitHub archives are not always byte-stable); continuing"
 mkdir -p "$DEST"
-tar -xzf "$TAR" -C "$DEST" --strip-components=1
+if [ -f "$TAR" ] || curl -sL --fail -o "$TAR" "$URL"; then
+    echo "$SHA256  $TAR" | sha256sum -c - || echo "warning: checksum differs from ProsperoEden's (GitHub archives are not always byte-stable); continuing"
+    tar -xzf "$TAR" -C "$DEST" --strip-components=1
+else
+    # Archive downloads can be blocked (proxies); a shallow git fetch of the same commit works.
+    rm -f "$TAR"
+    echo "archive download failed; fetching $COMMIT with git"
+    git init -q "$ROOT/deps/eden-src"
+    git -C "$ROOT/deps/eden-src" fetch -q --depth 1 https://github.com/eden-emulator/mirror "$COMMIT"
+    git -C "$ROOT/deps/eden-src" archive FETCH_HEAD | tar -x -C "$DEST"
+    rm -rf "$ROOT/deps/eden-src"
+fi
 cd "$DEST"
 git init -q
 git config core.autocrlf false

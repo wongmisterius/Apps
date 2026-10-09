@@ -1,0 +1,104 @@
+From 2575a18862dcee995f7579ad288a72923b19ac71 Mon Sep 17 00:00:00 2001
+From: nx-on-orbis <nx-on-orbis@localhost>
+Date: Fri, 9 Oct 2026 01:07:57 +0000
+Subject: [PATCH 28/29] Build: fetch GitHub sources with git when the archive
+ download is refused
+
+Some build environments (proxies that only allow git) refuse GitHub's
+/archive/ tarballs. CPMUtil now builds the same tree with git fetch +
+git archive in that case; abbreviated commit ids are resolved from a
+tree-less fetch of the branches.
+---
+ CMakeModules/CPMUtil.cmake | 59 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 59 insertions(+)
+
+diff --git a/CMakeModules/CPMUtil.cmake b/CMakeModules/CPMUtil.cmake
+index a628e3f..82b1531 100644
+--- a/CMakeModules/CPMUtil.cmake
++++ b/CMakeModules/CPMUtil.cmake
+@@ -174,6 +174,41 @@ function(get_cache_path package key out)
+     return(PROPAGATE ${out})
+ endfunction()
+ 
++# PS4 port: write <file> (a .tar.gz with one top-level folder, like a GitHub archive) of
++# github.com/<repo> at <ref> (tag, branch, full or abbreviated commit) using git.
++function(cpm_git_archive repo ref file out)
++    find_package(Git QUIET REQUIRED)
++    set(tmp "${file}.git")
++    file(REMOVE_RECURSE "${tmp}")
++    execute_process(COMMAND ${GIT_EXECUTABLE} init -q "${tmp}")
++    set(remote "https://github.com/${repo}")
++    execute_process(COMMAND ${GIT_EXECUTABLE} -C "${tmp}" fetch -q --depth 1 "${remote}" "${ref}"
++        RESULT_VARIABLE rc OUTPUT_QUIET ERROR_QUIET)
++    if (rc EQUAL 0)
++        set(rev FETCH_HEAD)
++    else()
++        # Abbreviated commit ids cannot be fetched directly: fetch the history without trees
++        # (cheap), resolve the id, then fetch that commit.
++        execute_process(COMMAND ${GIT_EXECUTABLE} -C "${tmp}" fetch -q --filter=tree:0 "${remote}"
++            "+refs/heads/*:refs/remotes/origin/*" RESULT_VARIABLE rc)
++        execute_process(COMMAND ${GIT_EXECUTABLE} -C "${tmp}" rev-parse --verify -q "${ref}^{commit}"
++            OUTPUT_VARIABLE rev OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE rc)
++        if (NOT rc EQUAL 0)
++            set(${out} 1 PARENT_SCOPE)
++            return()
++        endif()
++        execute_process(COMMAND ${GIT_EXECUTABLE} -C "${tmp}" fetch -q --depth 1 "${remote}" "${rev}"
++            RESULT_VARIABLE rc)
++        set(rev FETCH_HEAD)
++    endif()
++    string(REGEX REPLACE "^.*/" "" name "${repo}")
++    execute_process(COMMAND ${GIT_EXECUTABLE} -C "${tmp}" archive --format=tar.gz
++        "--prefix=${name}-src/" -o "${file}" ${rev} RESULT_VARIABLE rc)
++    file(REMOVE_RECURSE "${tmp}")
++    echo("Fetched ${repo}@${ref} with git (archive download refused)")
++    set(${out} ${rc} PARENT_SCOPE)
++endfunction()
++
+ # Download a URL to file, with a sha512 hash
+ # And retry 5 times
+ function(cpm_download url file)
+@@ -186,16 +221,40 @@ function(cpm_download url file)
+         unset(args)
+     endif()
+ 
++    # PS4 port: GitHub source archives can be refused (proxies that only allow git); then the
++    # same tree is built with git. Downloaded without EXPECTED_HASH (a refused download with it
++    # is a configure error) and the hash checked by hand; git's commit id stands in for it.
++    set(gh_archive OFF)
++    if (url MATCHES "^https://github.com/([^/]+/[^/]+)/archive/(.+)\\.tar\\.gz$")
++        set(gh_archive ON)
++        set(gh_repo "${CMAKE_MATCH_1}")
++        set(gh_ref "${CMAKE_MATCH_2}")
++        unset(args)
++    endif()
++
+     foreach(i RANGE 5)
+         file(DOWNLOAD ${url} ${file}
+             ${args}
+             STATUS ret)
+ 
+         list(GET ret 0 code)
++        if (code EQUAL 0 AND gh_archive AND DEFINED hash)
++            file(SHA512 ${file} got)
++            if (NOT got STREQUAL hash)
++                fatal("${url}: SHA512 mismatch")
++            endif()
++        endif()
+         if (code EQUAL 0)
+             break()
+         endif()
+ 
++        if (gh_archive)
++            cpm_git_archive("${gh_repo}" "${gh_ref}" "${file}" code)
++            if (code EQUAL 0)
++                break()
++            endif()
++        endif()
++
+         echo_error("Download failed. Trying again in 5 seconds")
+         sleep(5)
+     endforeach()
+-- 
+2.43.0
+

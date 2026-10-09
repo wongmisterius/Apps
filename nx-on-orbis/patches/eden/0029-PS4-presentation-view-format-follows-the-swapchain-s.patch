@@ -1,0 +1,56 @@
+From c704fb103ac3f4f7914887cb30a86456d7d84a6d Mon Sep 17 00:00:00 2001
+From: nx-on-orbis <nx-on-orbis@localhost>
+Date: Fri, 9 Oct 2026 01:07:57 +0000
+Subject: [PATCH 29/29] PS4: presentation view format follows the swapchain's
+ channel order (fixes red/blue swap)
+
+The presentation frame is created with the swapchain's format and rendered
+through a view of image_view_format, hard-coded to B8G8R8A8 off Android.
+The PS4 WSI only offers R8G8B8A8 (its scan-out buffer is A8B8G8R8), so every
+pixel was stored with red and blue exchanged and the blit to the swapchain
+showed it as is: the whole image (3D, video, UI) had R and B swapped.
+---
+ .../renderer_vulkan/vk_swapchain.cpp          | 20 +++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_swapchain.cpp b/src/video_core/renderer_vulkan/vk_swapchain.cpp
+index fea5398..d659a9a 100644
+--- a/src/video_core/renderer_vulkan/vk_swapchain.cpp
++++ b/src/video_core/renderer_vulkan/vk_swapchain.cpp
+@@ -316,8 +316,8 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
+         swapchain_ci.imageFormat,  // Base format MUST be first
+         VK_FORMAT_B8G8R8A8_UNORM,
+         VK_FORMAT_B8G8R8A8_SRGB,
+-#ifdef __ANDROID__
+-        VK_FORMAT_R8G8B8A8_UNORM,  // Android may use RGBA
++#if defined(__ANDROID__) || defined(__ORBIS__)
++        VK_FORMAT_R8G8B8A8_UNORM,  // Android and the PS4 may use RGBA
+         VK_FORMAT_R8G8B8A8_SRGB,
+ #endif
+     };
+@@ -344,6 +344,22 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
+ #ifdef __ANDROID__
+     // Android is already ordered the same as Switch.
+     image_view_format = VK_FORMAT_R8G8B8A8_UNORM;
++#elif defined(__ORBIS__)
++    // PS4: the presentation frame is created with the swapchain's format and rendered through a
++    // view of this format, so the two must share a channel order. The console's WSI only offers
++    // R8G8B8A8 (its scan-out buffer is A8B8G8R8); a B8G8R8A8 view of an R8G8B8A8 image stores
++    // every pixel with red and blue exchanged, which the blit to the swapchain then shows as is.
++    switch (surface_format.format) {
++    case VK_FORMAT_R8G8B8A8_UNORM:
++    case VK_FORMAT_R8G8B8A8_SRGB:
++        image_view_format = VK_FORMAT_R8G8B8A8_UNORM;
++        break;
++    default:
++        image_view_format = VK_FORMAT_B8G8R8A8_UNORM;
++        break;
++    }
++    LOG_INFO(Render_Vulkan, "PS4 swapchain format {} -> presentation view format {}",
++             static_cast<u32>(surface_format.format), static_cast<u32>(image_view_format));
+ #else
+     image_view_format = VK_FORMAT_B8G8R8A8_UNORM;
+ #endif
+-- 
+2.43.0
+

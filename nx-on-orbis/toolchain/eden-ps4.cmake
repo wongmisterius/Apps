@@ -1,9 +1,10 @@
 # PS4 toolchain for Eden: the orbis-sdk toolchain, with LLVM 18's libc++ (built by eden-ps4 in
 # libcxx18/) in place of the SDK's libc++ 11, and the include overlay that makes musl's headers
 # agree with it (toolchain/include-overlay: math.h, stdlib.h).
-include("C:/Users/alejo/eden-ps4/sdk-dl/orbis-sdk-v1/toolchain/orbis-sdk.cmake")
-set(EDEN_PS4_LIBCXX "C:/Users/alejo/eden-ps4/libcxx18")
-set(EDEN_PS4_OVERLAY "C:/Users/alejo/eden-ps4/toolchain/include-overlay")
+get_filename_component(_nxo_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+include("${_nxo_root}/sdk-dl/orbis-sdk-v1/toolchain/orbis-sdk.cmake")
+set(EDEN_PS4_LIBCXX "${_nxo_root}/libcxx18")
+set(EDEN_PS4_OVERLAY "${_nxo_root}/toolchain/include-overlay")
 string(REPLACE "-isystem ${OO_PS4_TOOLCHAIN}/include/c++/v1"
        "-nostdinc++ -fexperimental-library -isystem ${EDEN_PS4_LIBCXX}/include/c++/v1 -isystem ${EDEN_PS4_OVERLAY}"
        CMAKE_CXX_FLAGS_INIT "${CMAKE_CXX_FLAGS_INIT}")
@@ -19,6 +20,12 @@ string(REPLACE "-L${OO_PS4_TOOLCHAIN}/lib" "-L${EDEN_PS4_LIBCXX}/lib -L${OO_PS4_
        CMAKE_EXE_LINKER_FLAGS_INIT "${CMAKE_EXE_LINKER_FLAGS_INIT}")
 set(CMAKE_C_STANDARD_LIBRARIES   "-lc++experimental -lc++ -lc++abi -lunwind -lc -lkernel ${ORBIS_CRT1}")
 set(CMAKE_CXX_STANDARD_LIBRARIES "${CMAKE_C_STANDARD_LIBRARIES}")
+# Never search the build host's /usr/include (on a Linux host clang adds it for the FreeBSD
+# triple; __has_include(<linux/...>) then picks up glibc/kernel headers). Same result as the
+# original Windows build, which had no host headers to find.
+set(CMAKE_C_FLAGS_INIT "${CMAKE_C_FLAGS_INIT} -nostdlibinc")
+set(CMAKE_CXX_FLAGS_INIT "${CMAKE_CXX_FLAGS_INIT} -nostdlibinc")
+set(CMAKE_ASM_FLAGS_INIT "${CMAKE_ASM_FLAGS_INIT} -nostdlibinc")
 # Frame pointers everywhere: the console's crash reports walk rbp (no debugger on the PS4).
 set(CMAKE_C_FLAGS_INIT "${CMAKE_C_FLAGS_INIT} -fno-omit-frame-pointer")
 set(CMAKE_CXX_FLAGS_INIT "${CMAKE_CXX_FLAGS_INIT} -fno-omit-frame-pointer")

@@ -9,10 +9,14 @@ set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(dirname "$HERE")"
 SDK="$ROOT/sdk-dl/orbis-sdk-v1/sdk"
-BIN="$SDK/bin/windows"
-OO="C:/Users/alejo/soh-ps4/tools/OpenOrbis/OpenOrbis/PS4Toolchain"
+OO="${NXO_OO:-$ROOT/sdk-dl/PS4Toolchain}"   # OpenOrbis PS4Toolchain checkout (samples/piglet)
 export DOTNET_ROLL_FORWARD=LatestMajor
-export OO_PS4_TOOLCHAIN="$(cygpath -m "$SDK")"
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) BIN="$SDK/bin/windows"; X=.exe; mp() { cygpath -m "$1"; } ;;
+  *)                    BIN="$SDK/bin/linux";   X=;     mp() { printf '%s' "$1"; } ;;
+esac
+PY="$(command -v python3 || command -v python)"
+export OO_PS4_TOOLCHAIN="$(mp "$SDK")"
 OUT="$ROOT/out"
 rm -rf "$OUT"; mkdir -p "$OUT"
 # System auth info + program id of the OpenOrbis Piglet sample: what SoH ships with.
@@ -23,13 +27,13 @@ pkg() {
     local L="$1" TID="$2" LABEL="$3" TITLE="$4" IN="$5" SIGN="$6" VAR="$7"
     local CID="IV0000-${TID}_00-${LABEL}" ST="$ROOT/stage-$L"
     rm -rf "$ST"; mkdir -p "$ST/sce_sys/about" "$ST/sce_module"
-    python "$HERE/make-icon.py" "$ST/sce_sys/icon0.png" "$L"
+    "$PY" "$HERE/make-icon.py" "$ST/sce_sys/icon0.png" "$L"
     if [ "$SIGN" = soh ]; then
-        "$BIN/create-fself.exe" -in="$(cygpath -m "$IN")" -out="$(cygpath -m "$ST/x.oelf")" \
-            --eboot "$(cygpath -m "$ST/eboot.bin")" --paid 0x3800000000000035 --authinfo "$SOH_AUTHINFO" >/dev/null
+        "$BIN/create-fself$X" -in="$(mp "$IN")" -out="$(mp "$ST/x.oelf")" \
+            --eboot "$(mp "$ST/eboot.bin")" --paid 0x3800000000000035 --authinfo "$SOH_AUTHINFO" >/dev/null
     else
-        "$BIN/create-fself.exe" -in="$(cygpath -m "$IN")" -out="$(cygpath -m "$ST/x.oelf")" \
-            --eboot "$(cygpath -m "$ST/eboot.bin")" --paid 0x3800000000000011 >/dev/null
+        "$BIN/create-fself$X" -in="$(mp "$IN")" -out="$(mp "$ST/x.oelf")" \
+            --eboot "$(mp "$ST/eboot.bin")" --paid 0x3800000000000011 >/dev/null
     fi
     rm -f "$ST/x.oelf"
     cp "$OO/samples/piglet/sce_sys/about/right.sprx" "$ST/sce_sys/about/"
@@ -38,7 +42,7 @@ pkg() {
     if [ -n "$VAR" ]; then echo "$VAR" > "$ST/variant.txt"; FILES="$FILES variant.txt"; fi
     (
         cd "$ST"
-        local P="$BIN/PkgTool.Core.exe" SFO=sce_sys/param.sfo
+        local P="$BIN/PkgTool.Core$X" SFO=sce_sys/param.sfo
         "$P" sfo_new $SFO >/dev/null
         s() { "$P" sfo_setentry $SFO "$1" --type "$2" --maxsize "$3" --value "$4" >/dev/null; }
         s APP_TYPE Integer 4 1
@@ -54,8 +58,8 @@ pkg() {
         s TITLE Utf8 128 "$TITLE"
         s TITLE_ID Utf8 12 "$TID"
         s VERSION Utf8 8 "01.00"
-        "$BIN/create-gp4.exe" -out pkg.gp4 --content-id="$CID" --files "$FILES" >/dev/null
-        "$P" pkg_build pkg.gp4 "$(cygpath -m "$OUT")" >/dev/null
+        "$BIN/create-gp4$X" -out pkg.gp4 --content-id="$CID" --files "$FILES" >/dev/null
+        "$P" pkg_build pkg.gp4 "$(mp "$OUT")" >/dev/null
     )
     echo "$L: $CID.pkg"
 }
