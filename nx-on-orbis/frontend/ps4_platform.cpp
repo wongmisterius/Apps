@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // eden-ps4: the console-facing pieces of the frontend. See ps4_platform.h.
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -39,7 +41,38 @@ size_t sceKernelGetDirectMemorySize(void);
 int32_t sceUserServiceInitialize(void* params);
 int32_t sceUserServiceGetInitialUser(int32_t* user);
 int32_t sceSystemServiceHideSplashScreen(void);
+int32_t sceSysmoduleLoadModule(uint16_t id);
+int32_t sceCommonDialogInitialize(void);
+
+// libSceImeDialog. Declared here rather than from <orbis/ImeDialog.h>: the console's text is
+// UTF-16 (2-byte units) while this compiler's wchar_t is 4 bytes, so the SDK's wchar_t* fields
+// would invite the wrong buffer type. The layout is Sony's SceImeDialogParam (96 bytes).
+struct ImeDialogParam {
+    int32_t user_id;
+    int32_t type; // 0 default, 4 number
+    uint64_t supported_languages;
+    int32_t enter_label;
+    int32_t input_method;
+    void* filter;
+    uint32_t option;
+    uint32_t max_text_length;
+    char16_t* input_text_buffer;
+    float posx, posy;
+    int32_t horizontal_alignment, vertical_alignment;
+    const char16_t* placeholder;
+    const char16_t* title;
+    int8_t reserved[16];
+};
+struct ImeDialogResult {
+    int32_t end_status; // 0 ok, 1 cancel, 2 aborted
+    int8_t reserved[12];
+};
+int32_t sceImeDialogInit(const ImeDialogParam* param, void* extended);
+int32_t sceImeDialogGetStatus(void); // 0 none, 1 running, 2 finished
+int32_t sceImeDialogGetResult(ImeDialogResult* result);
+int32_t sceImeDialogTerm(void);
 }
+static_assert(sizeof(ImeDialogParam) == 96);
 
 namespace Ps4 {
 
@@ -416,6 +449,10 @@ int32_t LoadModule(const std::string& path) {
     return handle;
 }
 
+std::atomic<bool> g_ime_active{false};
+std::mutex g_ime_mutex;
+bool g_ime_ready = false;
+
 } // Anonymous namespace
 
 std::uint64_t NowUs() {
@@ -563,6 +600,13 @@ PadState ReadPad() {
     state.ry = data.rightStick.y;
     state.l2 = data.analogButtons.l2;
     state.r2 = data.analogButtons.r2;
+    // DualShock 4 touch pad: 1920 x 943 (scePadGetControllerInformation on the DS4).
+    state.touches = std::min<std::uint8_t>(data.touch.fingers, 2);
+    for (unsigned i = 0; i < state.touches; ++i) {
+        state.tx[i] = std::clamp(data.touch.touch[i].x / 1919.0f, 0.0f, 1.0f);
+        state.ty[i] = std::clamp(data.touch.touch[i].y / 942.0f, 0.0f, 1.0f);
+        state.touch_id[i] = data.touch.touch[i].finger;
+    }
     return state;
 }
 
@@ -580,6 +624,61 @@ std::uint64_t FreeDirectMemory() {
     sceKernelAvailableDirectMemorySize(0, static_cast<off_t>(sceKernelGetDirectMemorySize()), 0, &phys,
                                        &size);
     return size;
+}
+
+bool ImeActive() {
+    return g_ime_active.load(std::memory_order_relaxed);
+}
+
+bool ImeInput(const std::u16string& title, const std::u16string& initial, unsigned max_length,
+              bool numbers_only, std::u16string& text, bool& cancelled) {
+    std::lock_guard lock{g_ime_mutex};
+    if (!g_ime_ready) {
+        const int32_t m1 = sceSysmoduleLoadModule(0x0096); // libSceImeDialog
+        const int32_t m2 = sceCommonDialogInitialize();
+        Log("ime: load module 0x%08x, common dialog 0x%08x", static_cast<unsigned>(m1),
+            static_cast<unsigned>(m2));
+        g_ime_ready = true;
+    }
+    int32_t user = -1;
+    sceUserServiceGetInitialUser(&user);
+    // The dialog takes up to 2048 characters; Switch games ask for far fewer.
+    const unsigned max = max_length == 0 ? 32 : std::min(max_length, 2048u);
+    std::u16string buffer(max + 1, u'\0');
+    std::u16string title_z = title.empty() ? std::u16string(u"Texto") : title;
+    title_z.resize(std::min<std::size_t>(title_z.size(), 127));
+    std::copy_n(initial.begin(), std::min<std::size_t>(initial.size(), max), buffer.begin());
+
+    ImeDialogParam param{};
+    param.user_id = user;
+    param.type = numbers_only ? 4 : 0;
+    param.max_text_length = max;
+    param.input_text_buffer = buffer.data();
+    param.posx = 1920.0f / 2.0f;
+    param.posy = 1080.0f / 2.0f;
+    param.horizontal_alignment = 1; // center
+    param.vertical_alignment = 1;   // center
+    param.title = title_z.c_str();
+
+    g_ime_active.store(true);
+    const int32_t init = sceImeDialogInit(&param, nullptr);
+    if (init < 0) {
+        Log("ime: sceImeDialogInit 0x%08x", static_cast<unsigned>(init));
+        g_ime_active.store(false);
+        return false;
+    }
+    while (sceImeDialogGetStatus() == 1) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+    ImeDialogResult result{};
+    const int32_t got = sceImeDialogGetResult(&result);
+    sceImeDialogTerm();
+    g_ime_active.store(false);
+
+    cancelled = got < 0 || result.end_status != 0;
+    text.assign(buffer.c_str());
+    Log("ime: closed (%s), %zu characters", cancelled ? "cancelled" : "ok", text.size());
+    return true;
 }
 
 } // namespace Ps4

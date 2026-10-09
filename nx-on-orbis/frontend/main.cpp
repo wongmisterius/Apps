@@ -46,9 +46,11 @@
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
 #include "core/hle/service/am/applet_manager.h"
+#include "core/hle/service/am/frontend/applets.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
 #include "core/perf_stats.h"
+#include "input_common/drivers/touch_screen.h"
 #include "input_common/drivers/virtual_gamepad.h"
 #include "input_common/main.h"
 #include "video_core/gpu.h"
@@ -56,6 +58,7 @@
 #include "video_core/renderer_base.h"
 
 #include "menu/rom_menu.h"
+#include "ps4_keyboard.h"
 #include "ps4_platform.h"
 
 namespace fs = std::filesystem;
@@ -293,6 +296,11 @@ void ApplySettingsFile() {
         } else if (key == "gpu_accuracy" && (value == "low" || value == "high")) {
             v.gpu_accuracy.SetValue(value == "low" ? Settings::GpuAccuracy::Low
                                                    : Settings::GpuAccuracy::High);
+        } else if (key == "touchpad" && (value == "on" || value == "off")) {
+            g_touchpad = value == "on";
+        } else if (key == "docked" && (value == "on" || value == "off")) {
+            v.use_docked_mode.SetValue(value == "on" ? Settings::ConsoleMode::Docked
+                                                     : Settings::ConsoleMode::Handheld);
         } else if (key == "async_shaders" && (value == "on" || value == "off")) {
             v.use_asynchronous_shaders.SetValue(value == "on");
         } else if (key == "env" && value.find('=') != std::string::npos && value.find('=') > 0) {
@@ -307,6 +315,20 @@ void ApplySettingsFile() {
 }
 
 /// DualShock 4 -> the virtual gamepad Eden binds to player 1, by position like a Switch pad.
+/// Touch pad as the Switch touch screen (settings.txt touchpad=off disables it). Clicking the pad
+/// is the Minus button, so no touch is reported while it is pressed.
+bool g_touchpad = true;
+
+void PollTouch(InputCommon::TouchScreen& touch, const Ps4::PadState& s) {
+    touch.ClearActiveFlag();
+    if (g_touchpad && !(s.buttons & Ps4::Button::TouchPad)) {
+        for (unsigned i = 0; i < s.touches; ++i) {
+            touch.TouchMoved(s.tx[i], s.ty[i], s.touch_id[i]);
+        }
+    }
+    touch.ReleaseInactiveTouch();
+}
+
 void PollPad(InputCommon::VirtualGamepad& pad, const Ps4::PadState& s) {
     using VB = InputCommon::VirtualGamepad::VirtualButton;
     struct Map {
@@ -405,7 +427,7 @@ void CheckMutexes() {
 int main() {
     Ps4::OpenBootLog();
     Ps4::Log("eden-ps4 starting (Eden %s %s)", Common::g_scm_branch, Common::g_scm_desc);
-    Ps4::Log("PS4 build: %s; test 22: speed - btver2 build, gpu_accuracy low, no reactive flushing, texture audit off, profiler; defaults CPU ASTC, swizzle test off",
+    Ps4::Log("PS4 build: %s; tl1: v0.1.0 + R/B presentation fix + console keyboard (sceImeDialog)",
              EDEN_PS4_BUILD_ID);
     Ps4::InstallCrashReporting();
     Ps4::StartWatchdog();
@@ -468,6 +490,12 @@ int main() {
     system.ApplySettings();
     Ps4Window window;
 
+    {
+        // Text fields (names in Tomodachi Life and the like) go to the console's keyboard.
+        Service::AM::Frontend::FrontendAppletSet applets;
+        applets.software_keyboard = std::make_unique<Ps4::SoftwareKeyboard>();
+        system.SetFrontendAppletSet(std::move(applets));
+    }
     system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
     system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
     system.GetFileSystemController().CreateFactories(*system.GetFilesystem());
@@ -523,6 +551,7 @@ int main() {
 
     // Controller in, status out, until the game exits or Options + touch pad is held 2 s.
     auto* gamepad = input.GetVirtualGamepad();
+    auto* touch_screen = input.GetTouchScreen();
     std::uint64_t quit_since = 0;
     std::uint64_t last_status = Ps4::NowUs();
     unsigned status_count = 0;
@@ -534,9 +563,16 @@ int main() {
                 break;
             }
         }
-        const Ps4::PadState pad = Ps4::ReadPad();
+        Ps4::PadState pad = Ps4::ReadPad();
+        if (Ps4::ImeActive()) {
+            // The console keyboard has the controller: the game sees it released.
+            pad = Ps4::PadState{.connected = pad.connected};
+        }
         if (pad.connected && gamepad != nullptr) {
             PollPad(*gamepad, pad);
+        }
+        if (touch_screen != nullptr) {
+            PollTouch(*touch_screen, pad);
         }
         const bool quit_combo = (pad.buttons & Ps4::Button::Options) && (pad.buttons & Ps4::Button::TouchPad);
         if (!quit_combo) {

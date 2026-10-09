@@ -1,7 +1,7 @@
 # eden-ps4: the PS4 frontend executable (included from inject.cmake after Eden's targets exist).
 set(_fe "${EDEN_PS4_FRONTEND_DIR}")
 add_executable(eden-ps4 "${_fe}/main.cpp" "${_fe}/ps4_platform.cpp" "${_fe}/ps4_platform.h"
-    "${_fe}/heap_census.cpp" "${_fe}/menu/rom_menu.cpp" "${_fe}/menu/rom_menu.h"
+    "${_fe}/heap_census.cpp" "${_fe}/ps4_keyboard.cpp" "${_fe}/ps4_keyboard.h" "${_fe}/menu/rom_menu.cpp" "${_fe}/menu/rom_menu.h"
     "${_fe}/../tests/flat_map_check.cpp"
     "${_fe}/libc_wide_fixes.cpp"
     # compiler-rt 18.1.8 emulated-TLS runtime (the whole build uses -femulated-tls)
@@ -18,7 +18,7 @@ string(TIMESTAMP _ps4_build_stamp "%Y%m%dT%H%M%SZ" UTC)
 execute_process(COMMAND git -C "${PROJECT_SOURCE_DIR}" rev-parse --short=12 HEAD
     OUTPUT_VARIABLE _ps4_eden_revision OUTPUT_STRIP_TRAILING_WHITESPACE
     COMMAND_ERROR_IS_FATAL ANY)
-set(_ps4_build_id "test22-${_ps4_build_stamp}-${_ps4_eden_revision}")
+set(_ps4_build_id "tl1-${_ps4_build_stamp}-${_ps4_eden_revision}")
 target_compile_definitions(eden-ps4 PRIVATE EDEN_PS4_BUILD_ID="${_ps4_build_id}")
 file(WRITE "${CMAKE_BINARY_DIR}/eden-ps4-build-id.txt" "${_ps4_build_id}\n")
 
@@ -36,7 +36,7 @@ target_link_libraries(eden-ps4 PRIVATE ps4-vkloader)
 
 # System libraries the frontend and the audio sink call.
 target_link_libraries(eden-ps4 PRIVATE -lSceAudioOut -lScePad -lSceUserService -lSceSystemService
-    -lSceSysmodule -lSceNet)
+    -lSceSysmodule -lSceNet -lSceImeDialog -lSceCommonDialog)
 
 # Heap census (heap_census.cpp): every allocation goes through the wrappers.
 target_link_options(eden-ps4 PRIVATE -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc

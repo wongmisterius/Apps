@@ -1,27 +1,42 @@
 # Building from source
 
+## Linux (Ubuntu 24.04), the short way
+
+All paths are now relative to the repository. On Linux the system LLVM 18 and the SDK's Linux
+packaging tools are used:
+
+```bash
+sudo apt install clang-18 lld-18 llvm-18 ninja-build glslang-tools perl make python3 git curl
+pip install "cmake>=3.31"                       # Eden needs CMake 3.31+
+# SDK: orbis-sdk-v1.tar.gz unpacked as sdk-dl/orbis-sdk-v1/ (see §2, no local changes needed)
+git clone --depth 1 --filter=blob:none --sparse https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain sdk-dl/PS4Toolchain
+git -C sdk-dl/PS4Toolchain sparse-checkout set samples/piglet   # prx files for the package
+bash scripts/build-libcxx.sh                    # -> libcxx18/
+bash scripts/build-deps.sh                      # -> prefix/ (OpenSSL, FFmpeg)
+bash scripts/fetch-eden.sh                      # -> deps/eden (+ patches/eden)
+bash configure-eden.sh
+source tools/env-build.sh && unset OO_PS4_TOOLCHAIN && cmake --build build-eden --target eden-ps4
+bash package-eden.sh                            # -> out-eden/*.pkg, ELF copy in elf/
+```
+
+Everything is built with `-nostdlibinc`: on a Linux host clang otherwise adds the host's
+`/usr/include` to the PS4 target, and `__has_include(<linux/...>)` picks up glibc headers. If GitHub
+source archives are refused (some proxies only allow git), `fetch-eden.sh` and Eden's CPMUtil
+(patch `0028`) fetch the same commits with git.
+
+The rest of this page is the original Windows procedure.
+
+## Windows
+
 Everything was built on **Windows 11 with Git Bash**. It has only ever been built on one machine, and
 the scripts use that machine's absolute paths. Expect to adjust things; this page lists every piece
 and how it was made, so the build can be reproduced.
 
 ## 0. Paths
 
-The scripts and toolchain files hard-code two roots from the original machine:
-
-| Original path | What it is |
-|---|---|
-| `C:/Users/alejo/eden-ps4` (and `/c/Users/alejo/eden-ps4`) | this repository |
-| `C:/Users/alejo/soh-ps4/tools` (and `/c/Users/alejo/soh-ps4/tools`) | host tools: LLVM 18, CMake, Ninja, glslang, OpenOrbis |
-
-Replace them with yours, for example:
-
-```bash
-grep -rlE "(C:|/c)/Users/alejo/(eden-ps4|soh-ps4/tools)" --include=*.sh --include=*.cmake . \
-  | xargs sed -i -e "s#C:/Users/alejo/eden-ps4#C:/path/to/nx-on-orbis#g" \
-                 -e "s#/c/Users/alejo/eden-ps4#/c/path/to/nx-on-orbis#g" \
-                 -e "s#C:/Users/alejo/soh-ps4/tools#C:/path/to/tools#g" \
-                 -e "s#/c/Users/alejo/soh-ps4/tools#/c/path/to/tools#g"
-```
+The scripts derive every path from the repository's location. On Windows set `NXO_TOOLS` to the
+folder holding `llvm/bin`, `cmake/bin`, `ninja` and `glslang/bin`, and `NXO_OO` to the OpenOrbis
+PS4Toolchain folder if it is not `sdk-dl/PS4Toolchain` (`tools/env-build.sh`).
 
 ## 1. Host tools (in your tools folder)
 

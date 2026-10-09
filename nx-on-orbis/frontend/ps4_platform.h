@@ -45,6 +45,10 @@ struct PadState {
     std::uint32_t buttons{};
     std::uint8_t lx{128}, ly{128}, rx{128}, ry{128};
     std::uint8_t l2{}, r2{};
+    /// Fingers on the touch pad (0-2), positions scaled to 0..1.
+    std::uint8_t touches{};
+    float tx[2]{}, ty[2]{};
+    std::uint8_t touch_id[2]{};
 };
 
 /// Opens the first user's controller. False if there is none.
@@ -71,6 +75,14 @@ inline constexpr std::uint32_t Cross = 0x4000;
 inline constexpr std::uint32_t Square = 0x8000;
 inline constexpr std::uint32_t TouchPad = 0x100000;
 } // namespace Button
+
+/// The system on-screen keyboard (sceImeDialog), for the Switch software keyboard applet.
+/// Blocks until the user closes it. Returns false if the dialog could not be opened at all;
+/// otherwise `cancelled` says whether the user backed out, and `text` holds what was typed.
+/// While it is open, ImeActive() is true and the game must not see the controller.
+bool ImeInput(const std::u16string& title, const std::u16string& initial, unsigned max_length,
+              bool numbers_only, std::u16string& text, bool& cancelled);
+bool ImeActive();
 
 /// Monotonic microseconds.
 std::uint64_t NowUs();
