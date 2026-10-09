@@ -74,6 +74,10 @@ extern int ps4_a2b10_mode;   // vk_texture_cache.cpp
 
 namespace {
 
+/// Touch pad as the Switch touch screen (settings.txt touchpad=off disables it). Clicking the pad
+/// is the Minus button, so no touch is reported while it is pressed.
+bool g_touchpad = true;
+
 constexpr u32 OutputWidth = 1920;
 constexpr u32 OutputHeight = 1080;
 
@@ -315,10 +319,6 @@ void ApplySettingsFile() {
 }
 
 /// DualShock 4 -> the virtual gamepad Eden binds to player 1, by position like a Switch pad.
-/// Touch pad as the Switch touch screen (settings.txt touchpad=off disables it). Clicking the pad
-/// is the Minus button, so no touch is reported while it is pressed.
-bool g_touchpad = true;
-
 void PollTouch(InputCommon::TouchScreen& touch, const Ps4::PadState& s) {
     touch.ClearActiveFlag();
     if (g_touchpad && !(s.buttons & Ps4::Button::TouchPad)) {
