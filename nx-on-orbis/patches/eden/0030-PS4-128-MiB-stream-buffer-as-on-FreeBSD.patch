@@ -1,0 +1,28 @@
+From 79caaa37758e8bfc5124f0e657f3fac08ad2d72b Mon Sep 17 00:00:00 2001
+From: nx-on-orbis <nx-on-orbis@localhost>
+Date: Sun, 11 Oct 2026 15:57:47 +0000
+Subject: [PATCH] PS4: 128 MiB stream buffer, as on FreeBSD
+
+The stream buffer is a 256 MiB GARLIC allocation that the PS4 driver backs
+outside its GPU arena. Tomodachi Life ran direct memory out ~260 s in;
+128 MiB is what Eden already uses on FreeBSD.
+---
+ src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index 7b6571d..b396d86 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -33,7 +33,7 @@ constexpr VkDeviceSize MAX_ALIGNMENT = 256;
+ // Windows ones however, can intake bigger buffers and generally do not OOM.
+ // - GTX 960 on Windows will not OOM with 256mib
+ // - GT 1030 on ^NIX will OOM with 256mib
+-#if defined(__FreeBSD__)
++#if defined(__FreeBSD__) || defined(__ORBIS__) // PS4: the stream buffer is a GARLIC allocation outside the GPU arena
+ constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
+ #else
+ constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 256_MiB;
+-- 
+2.43.0
+

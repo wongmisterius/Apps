@@ -239,9 +239,10 @@ void ApplyPs4Settings() {
     setenv("MESA_LOG_FILE", mesa_log.string().c_str(), 1);
     setenv("MESA_LOG_LEVEL", "info", 1);
     setenv("RADV_DEBUG", "info", 1);
-    // The driver's GPU arena: 1024 MiB by default ran out loading an MK8D race (test 20); there
-    // was direct memory to spare. The texture and buffer caches size their budgets from this.
-    setenv("ORBIS_ARENA_MIB", "1280", 1);
+    // The driver's GPU arena; the texture and buffer caches size their budgets from it. MK8D
+    // races needed 1280 MiB (test 20), but Tomodachi Life runs direct memory out with it: its
+    // guest RAM grows past 1.5 GiB. settings.txt env=ORBIS_ARENA_MIB=1280 restores the old value.
+    setenv("ORBIS_ARENA_MIB", "1024", 1);
 }
 
 /// settings.txt: lines "key=value" ('#' starts a comment). Each recognized line is logged; any
@@ -427,7 +428,7 @@ void CheckMutexes() {
 int main() {
     Ps4::OpenBootLog();
     Ps4::Log("eden-ps4 starting (Eden %s %s)", Common::g_scm_branch, Common::g_scm_desc);
-    Ps4::Log("PS4 build: %s; tl1: v0.1.0 + R/B presentation fix + console keyboard (sceImeDialog)",
+    Ps4::Log("PS4 build: %s; tl2: tl1 + 128 MiB stream buffer + 1024 MiB GPU arena",
              EDEN_PS4_BUILD_ID);
     Ps4::InstallCrashReporting();
     Ps4::StartWatchdog();
