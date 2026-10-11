@@ -68,12 +68,27 @@ __attribute__((noinline)) void Sites(std::uint64_t out[3]) {
     out[2] = ret[4];
 }
 
+/// Allocations this large (or any large one that fails) are logged when they happen: the periodic
+/// census missed a burst that ran the console out of memory between two samples.
+constexpr size_t LogThreshold = size_t{32} << 20;
+
 __attribute__((noinline)) void Track(void* ptr, size_t size) {
-    if (ptr == nullptr || size < Threshold) {
+    if (size < Threshold) {
         return;
     }
     std::uint64_t site[3];
     Sites(site);
+    if (ptr == nullptr || size >= LogThreshold) {
+        Ps4::Log("%s %lu MiB from eboot+0x%lx <- 0x%lx <- 0x%lx",
+                 ptr == nullptr ? "!! heap: FAILED allocation of" : "heap: allocation of",
+                 static_cast<unsigned long>(size >> 20),
+                 static_cast<unsigned long>(site[0] - ImageBase),
+                 static_cast<unsigned long>(site[1] - ImageBase),
+                 static_cast<unsigned long>(site[2] - ImageBase));
+    }
+    if (ptr == nullptr) {
+        return;
+    }
     Guard g;
     if (g_count < MaxLive) {
         g_live[g_count++] = {ptr, size, {site[0], site[1], site[2]}};

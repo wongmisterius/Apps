@@ -242,7 +242,9 @@ void ApplyPs4Settings() {
     ApplySystemLanguage();
     v.renderer_backend.SetValue(Settings::RendererBackend::Vulkan);
     v.use_multi_core.SetValue(true);
-    v.cpu_accuracy.SetValue(Settings::CpuAccuracy::Auto);
+    // Unsafe floating point in the JIT (test 24 measured it on MK8D): the processor is the limit
+    // while Tomodachi Life loads. settings.txt cpu_accuracy=auto restores Eden's default.
+    v.cpu_accuracy.SetValue(Settings::CpuAccuracy::Unsafe);
     // Handheld renders at 720p: less GPU work for a GPU that is much smaller than the PS5's.
     v.use_docked_mode.SetValue(Settings::ConsoleMode::Handheld);
     v.resolution_setup.SetValue(Settings::ResolutionSetup::Res1X);
@@ -368,6 +370,10 @@ void ApplySettingsFile() {
             v.language_index.SetValue(language);
             v.region_index.SetValue(region);
             Ps4::Log("language: settings.txt language=%s", value.c_str());
+        } else if (key == "cpu_accuracy" && (value == "unsafe" || value == "auto" || value == "accurate")) {
+            v.cpu_accuracy.SetValue(value == "unsafe" ? Settings::CpuAccuracy::Unsafe
+                                    : value == "auto" ? Settings::CpuAccuracy::Auto
+                                                      : Settings::CpuAccuracy::Accurate);
         } else if (key == "touchpad" && (value == "on" || value == "off")) {
             g_touchpad = value == "on";
         } else if (key == "docked" && (value == "on" || value == "off")) {
@@ -495,7 +501,7 @@ void CheckMutexes() {
 int main() {
     Ps4::OpenBootLog();
     Ps4::Log("eden-ps4 starting (Eden %s %s)", Common::g_scm_branch, Common::g_scm_desc);
-    Ps4::Log("PS4 build: %s; tl5: tl4 + 1280 MiB arena, smaller descriptor queues and JIT dispatch tables",
+    Ps4::Log("PS4 build: %s; tl6: tl5 + large file reads straight into guest memory, unsafe CPU accuracy, big-allocation log",
              EDEN_PS4_BUILD_ID);
     Ps4::InstallCrashReporting();
     Ps4::StartWatchdog();

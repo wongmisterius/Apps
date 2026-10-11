@@ -1,0 +1,126 @@
+From 63f06723e327ebbbd044e7e8784d3516f8343e62 Mon Sep 17 00:00:00 2001
+From: nx-on-orbis <nx-on-orbis@localhost>
+Date: Sun, 11 Oct 2026 17:05:39 +0000
+Subject: [PATCH] PS4: large mapped-alias IPC out buffers are written in place
+
+Every CMIF OutBuffer was a host scratch buffer of the full guest buffer size,
+copied into guest memory after the call. A file read of hundreds of MiB needs
+that much host heap at once; on the PS4 Tomodachi Life ran out of memory
+right after its first-run setup. When the guest range is plain (not GPU
+tracked) memory mapped contiguously on the host, buffers of 1 MiB or more
+now point straight at it (Memory::GetPlainContiguousSpan); anything else
+keeps the scratch copy.
+---
+ src/core/hle/service/cmif_serialization.h | 25 ++++++++++++++++++--
+ src/core/memory.cpp                       | 28 +++++++++++++++++++++++
+ src/core/memory.h                         |  3 +++
+ 3 files changed, 54 insertions(+), 2 deletions(-)
+
+diff --git a/src/core/hle/service/cmif_serialization.h b/src/core/hle/service/cmif_serialization.h
+index acc63f0..0266046 100644
+--- a/src/core/hle/service/cmif_serialization.h
++++ b/src/core/hle/service/cmif_serialization.h
+@@ -11,6 +11,9 @@
+ #include "core/hle/service/cmif_types.h"
+ #include "core/hle/service/ipc_helpers.h"
+ #include "core/hle/service/service.h"
++#ifdef __ORBIS__
++#include "core/memory.h"
++#endif
+ #include <typeinfo>
+ 
+ namespace Service {
+@@ -344,10 +347,28 @@ void ReadInArgument(bool is_domain, CallArguments& args, const u8* raw_data, HLE
+ 
+             // Set up scratch buffer.
+             auto& buffer = temp[OutBufferIndex];
++            buffer.resize_destructive(0);
++#ifdef __ORBIS__
++            // PS4: a large mapped-alias buffer (a file read) is written in place when the guest
++            // range is plain contiguous memory. The scratch copy would need the whole request as
++            // host heap at once; loading Tomodachi Life's island ran the console out of memory.
++            // An empty scratch buffer tells WriteOutArgument there is nothing to copy back.
++            if constexpr ((ArgType::Attr & BufferAttr_HipcMapAlias) != 0 &&
++                          (ArgType::Attr & BufferAttr_HipcAutoSelect) == 0) {
++                constexpr size_t DirectThreshold = size_t{1} << 20;
++                if (ctx.BufferDescriptorB().size() > OutBufferIndex) {
++                    const auto& desc = ctx.BufferDescriptorB()[OutBufferIndex];
++                    if (desc.Size() >= DirectThreshold) {
++                        if (u8* const host = ctx.GetMemory().GetPlainContiguousSpan(desc.Address(), desc.Size())) {
++                            std::get<ArgIndex>(args) = std::span(reinterpret_cast<ElementType*>(host), desc.Size() / sizeof(ElementType));
++                            return ReadInArgument<MethodArguments, CallArguments, PrevAlign, DataOffset, HandleIndex, InBufferIndex, OutBufferIndex + 1, RawDataFinished, ArgIndex + 1>(is_domain, args, raw_data, ctx, temp);
++                        }
++                    }
++                }
++            }
++#endif
+             if (ctx.CanWriteBuffer(OutBufferIndex)) {
+                 buffer.resize_destructive(ctx.GetWriteBufferSize(OutBufferIndex));
+-            } else {
+-                buffer.resize_destructive(0);
+             }
+ 
+             ElementType* ptr = (ElementType*) buffer.data();
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index 837016d..b1ca1c2 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -305,6 +305,30 @@ struct Memory::Impl {
+         return (current_page_table->entries[addr >> YUZU_PAGEBITS].Block() == current_page_table->entries[(addr + size) >> YUZU_PAGEBITS].Block()) ? GetPointerSilent(addr) : nullptr;
+     }
+ 
++    /// Host pointer to [addr, addr + size) when every page is plain guest memory (not tracked by
++    /// the GPU: those pages are "marked" and have no pointer) mapped contiguously on the host;
++    /// nullptr otherwise. Writing through it needs no rasterizer notification.
++    [[nodiscard]] u8* GetPlainContiguousSpan(VAddr addr, std::size_t size) noexcept {
++        addr &= 0xffffffffffffULL;
++        if (size == 0 || !AddressSpaceContains(*current_page_table, addr, size)) {
++            return nullptr;
++        }
++        const u64 first = addr >> YUZU_PAGEBITS;
++        const u64 last = (addr + size - 1) >> YUZU_PAGEBITS;
++        const uintptr_t base = Common::PageTable::PageEntryData::ExtractPointer(
++            current_page_table->entries[first].Raw());
++        if (base == 0) {
++            return nullptr;
++        }
++        for (u64 page = first + 1; page <= last; ++page) {
++            if (Common::PageTable::PageEntryData::ExtractPointer(
++                    current_page_table->entries[page].Raw()) != base) {
++                return nullptr;
++            }
++        }
++        return reinterpret_cast<u8*>(base + addr);
++    }
++
+     bool WriteBlockImpl(const Common::ProcessAddress addr, const void* buffer, const std::size_t size, bool unsafe) {
+         return WalkBlock(addr, size,
+         [addr, size](const std::size_t offset, const std::size_t copy_amount, const Common::ProcessAddress current_vaddr) {
+@@ -918,6 +942,10 @@ u8* Memory::GetSpan(const VAddr src_addr, const std::size_t size) {
+     return impl->GetSpan(src_addr, size);
+ }
+ 
++u8* Memory::GetPlainContiguousSpan(const VAddr addr, const std::size_t size) {
++    return impl->GetPlainContiguousSpan(addr, size);
++}
++
+ bool Memory::WriteBlock(const Common::ProcessAddress dest_addr, const void* src_buffer,
+                         const std::size_t size) {
+     return impl->WriteBlockImpl(dest_addr, src_buffer, size, false);
+diff --git a/src/core/memory.h b/src/core/memory.h
+index 7167efb..015a720 100644
+--- a/src/core/memory.h
++++ b/src/core/memory.h
+@@ -373,6 +373,9 @@ public:
+ 
+     const u8* GetSpan(const VAddr src_addr, const std::size_t size) const;
+     u8* GetSpan(const VAddr src_addr, const std::size_t size);
++    /// Host pointer for a guest range that is plain (not GPU-tracked) memory, mapped contiguously
++    /// on the host; nullptr otherwise. See Impl::GetPlainContiguousSpan.
++    u8* GetPlainContiguousSpan(const VAddr addr, const std::size_t size);
+ 
+     /**
+      * Writes a range of bytes into the current process' address space at the specified
+-- 
+2.43.0
+
