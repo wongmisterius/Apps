@@ -18,7 +18,8 @@ esac
 PY="$(command -v python3 || command -v python)"
 export OO_PS4_TOOLCHAIN="$(mp "$SDK")"
 
-TITLE="NX on Orbis"
+TITLE="${PKG_TITLE:-NX on Orbis tl1}"
+PKG_VER="${PKG_VER:-01.01}"   # higher than v0.1.0 (01.00) so the installer replaces it
 TITLE_ID="EDPS00001"
 CID="IV0000-${TITLE_ID}_00-EDENPS4000000000"
 ELF="${ELF:-$ROOT/build-eden/bin/eden-ps4}"
@@ -27,7 +28,7 @@ OUT="$ROOT/out-eden"
 
 [ -f "$ELF" ] || { echo "missing $ELF"; exit 1; }
 rm -rf "$ST"; mkdir -p "$ST/sce_sys/about" "$ST/sce_module" "$OUT"
-"$PY" "$ROOT/probe/make-icon.py" "$ST/sce_sys/icon0.png" "NX"
+"$PY" "$ROOT/probe/make-icon.py" "$ST/sce_sys/icon0.png" "${PKG_ICON:-tl1}"
 "$BIN/create-fself$X" -in="$(mp "$ELF")" -out="$(mp "$ST/x.oelf")" \
     --eboot "$(mp "$ST/eboot.bin")" --paid 0x3800000000000011 >/dev/null
 rm -f "$ST/x.oelf"
@@ -46,7 +47,7 @@ FILES="$FILES assets/misc/hbmenu.nro assets/misc/hbmenu-LICENSE.txt"
     "$P" sfo_new $SFO >/dev/null
     s() { "$P" sfo_setentry $SFO "$1" --type "$2" --maxsize "$3" --value "$4" >/dev/null; }
     s APP_TYPE Integer 4 1
-    s APP_VER Utf8 8 "01.00"
+    s APP_VER Utf8 8 "$PKG_VER"
     s ATTRIBUTE Integer 4 0
     s CATEGORY Utf8 4 gd
     s SYSTEM_VER Integer 4 0
@@ -54,7 +55,7 @@ FILES="$FILES assets/misc/hbmenu.nro assets/misc/hbmenu-LICENSE.txt"
     s DOWNLOAD_DATA_SIZE Integer 4 0
     s TITLE Utf8 128 "$TITLE"
     s TITLE_ID Utf8 12 "$TITLE_ID"
-    s VERSION Utf8 8 "01.00"
+    s VERSION Utf8 8 "$PKG_VER"
     "$BIN/create-gp4$X" -out pkg.gp4 --content-id="$CID" --files "$FILES" >/dev/null
     "$P" pkg_build pkg.gp4 "$(mp "$OUT")" >/dev/null
 )
