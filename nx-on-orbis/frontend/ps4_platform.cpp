@@ -41,6 +41,7 @@ size_t sceKernelGetDirectMemorySize(void);
 int32_t sceUserServiceInitialize(void* params);
 int32_t sceUserServiceGetInitialUser(int32_t* user);
 int32_t sceSystemServiceHideSplashScreen(void);
+int32_t sceSystemServiceParamGetInt(int32_t param_id, int32_t* value);
 int32_t sceSysmoduleLoadModule(uint16_t id);
 int32_t sceCommonDialogInitialize(void);
 
@@ -624,6 +625,12 @@ std::uint64_t FreeDirectMemory() {
     sceKernelAvailableDirectMemorySize(0, static_cast<off_t>(sceKernelGetDirectMemorySize()), 0, &phys,
                                        &size);
     return size;
+}
+
+int SystemLanguage() {
+    int32_t lang = -1;
+    const int32_t rc = sceSystemServiceParamGetInt(1 /* LANG */, &lang);
+    return rc < 0 ? -1 : lang;
 }
 
 bool ImeActive() {

@@ -84,6 +84,10 @@ bool ImeInput(const std::u16string& title, const std::u16string& initial, unsign
               bool numbers_only, std::u16string& text, bool& cancelled);
 bool ImeActive();
 
+/// The console's system language (sceSystemServiceParamGetInt LANG: 0 Japanese, 1 English US,
+/// 3 Spanish, 20 Spanish Latin America...), or -1 if it cannot be read.
+int SystemLanguage();
+
 /// Monotonic microseconds.
 std::uint64_t NowUs();
 

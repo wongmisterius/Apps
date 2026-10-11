@@ -30,6 +30,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -201,8 +202,44 @@ void InstallFirmware() {
     Ps4::Log("firmware: %zu NCAs installed now, %zu already there, %zu failed", copied, present, failed);
 }
 
+/// The Switch language and region closest to the PS4's system language (games take their
+/// language from the system settings). Region follows the language: Latin American Spanish,
+/// Brazilian Portuguese and Canadian French are Americas languages on the Switch.
+void ApplySystemLanguage() {
+    using L = Settings::Language;
+    using R = Settings::Region;
+    struct Map {
+        int ps4;
+        L language;
+        R region;
+    };
+    static constexpr Map map[] = {
+        {0, L::Japanese, R::Japan},          {1, L::EnglishAmerican, R::Usa},
+        {2, L::French, R::Europe},           {3, L::Spanish, R::Europe},
+        {4, L::German, R::Europe},           {5, L::Italian, R::Europe},
+        {6, L::Dutch, R::Europe},            {7, L::Portuguese, R::Europe},
+        {8, L::Russian, R::Europe},          {9, L::Korean, R::Korea},
+        {10, L::ChineseTraditional, R::Taiwan}, {11, L::ChineseSimplified, R::China},
+        {16, L::Polish, R::Europe},          {17, L::PortugueseBrazilian, R::Usa},
+        {18, L::EnglishBritish, R::Europe},  {20, L::SpanishLatin, R::Usa},
+        {22, L::FrenchCanadian, R::Usa},     {27, L::Thai, R::Usa},
+    };
+    const int lang = Ps4::SystemLanguage();
+    for (const auto& m : map) {
+        if (m.ps4 == lang) {
+            Settings::values.language_index.SetValue(m.language);
+            Settings::values.region_index.SetValue(m.region);
+            Ps4::Log("language: PS4 system language %d -> Switch language %u, region %u", lang,
+                     static_cast<unsigned>(m.language), static_cast<unsigned>(m.region));
+            return;
+        }
+    }
+    Ps4::Log("language: PS4 system language %d has no Switch equivalent, English (US) kept", lang);
+}
+
 void ApplyPs4Settings() {
     auto& v = Settings::values;
+    ApplySystemLanguage();
     v.renderer_backend.SetValue(Settings::RendererBackend::Vulkan);
     v.use_multi_core.SetValue(true);
     v.cpu_accuracy.SetValue(Settings::CpuAccuracy::Auto);
@@ -259,6 +296,28 @@ void ApplyPs4Settings() {
 ///   profile=on|off              sampling profiler in boot.log (default on)
 ///   async_shaders=on|off        (default on)
 ///   env=NAME=VALUE              environment for the PS4 driver (e.g. env=RADV_DEBUG=info,nohiz)
+std::optional<std::pair<Settings::Language, Settings::Region>> LanguageFromName(const std::string& name) {
+    using L = Settings::Language;
+    using R = Settings::Region;
+    static const std::pair<const char*, std::pair<L, R>> names[] = {
+        {"es", {L::Spanish, R::Europe}},          {"es-419", {L::SpanishLatin, R::Usa}},
+        {"en", {L::EnglishAmerican, R::Usa}},     {"en-gb", {L::EnglishBritish, R::Europe}},
+        {"fr", {L::French, R::Europe}},           {"fr-ca", {L::FrenchCanadian, R::Usa}},
+        {"de", {L::German, R::Europe}},           {"it", {L::Italian, R::Europe}},
+        {"ja", {L::Japanese, R::Japan}},          {"ko", {L::Korean, R::Korea}},
+        {"nl", {L::Dutch, R::Europe}},            {"pt", {L::Portuguese, R::Europe}},
+        {"pt-br", {L::PortugueseBrazilian, R::Usa}}, {"ru", {L::Russian, R::Europe}},
+        {"zh-cn", {L::ChineseSimplified, R::China}}, {"zh-tw", {L::ChineseTraditional, R::Taiwan}},
+        {"pl", {L::Polish, R::Europe}},           {"th", {L::Thai, R::Usa}},
+    };
+    for (const auto& [n, lr] : names) {
+        if (name == n) {
+            return lr;
+        }
+    }
+    return std::nullopt;
+}
+
 void ApplySettingsFile() {
     std::ifstream in{fs::path{Ps4::DataDir} / "settings.txt"};
     if (!in) {
@@ -301,6 +360,13 @@ void ApplySettingsFile() {
         } else if (key == "gpu_accuracy" && (value == "low" || value == "high")) {
             v.gpu_accuracy.SetValue(value == "low" ? Settings::GpuAccuracy::Low
                                                    : Settings::GpuAccuracy::High);
+        } else if (key == "language" && LanguageFromName(value)) {
+            // language=es, es-419, en, en-gb, fr, fr-ca, de, it, ja, ko, nl, pt, pt-br, ru, zh-cn,
+            // zh-tw, pl, th: overrides the PS4's system language (region follows it).
+            const auto [language, region] = *LanguageFromName(value);
+            v.language_index.SetValue(language);
+            v.region_index.SetValue(region);
+            Ps4::Log("language: settings.txt language=%s", value.c_str());
         } else if (key == "touchpad" && (value == "on" || value == "off")) {
             g_touchpad = value == "on";
         } else if (key == "docked" && (value == "on" || value == "off")) {
@@ -428,7 +494,7 @@ void CheckMutexes() {
 int main() {
     Ps4::OpenBootLog();
     Ps4::Log("eden-ps4 starting (Eden %s %s)", Common::g_scm_branch, Common::g_scm_desc);
-    Ps4::Log("PS4 build: %s; tl2: tl1 + 128 MiB stream buffer + 1024 MiB GPU arena",
+    Ps4::Log("PS4 build: %s; tl3: tl2 + game language from the PS4 system language (settings.txt language=)",
              EDEN_PS4_BUILD_ID);
     Ps4::InstallCrashReporting();
     Ps4::StartWatchdog();
