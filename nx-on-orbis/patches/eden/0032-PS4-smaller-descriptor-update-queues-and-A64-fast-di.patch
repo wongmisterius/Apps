@@ -1,0 +1,58 @@
+From f426cbccf8f22411824801b566bb0803b69a2a5c Mon Sep 17 00:00:00 2001
+From: nx-on-orbis <nx-on-orbis@localhost>
+Date: Sun, 11 Oct 2026 16:40:49 +0000
+Subject: [PATCH] PS4: smaller descriptor update queues and A64 fast dispatch
+ tables
+
+The descriptor update queues took 120 MiB of the C heap (8 frames x 512K
+entries) and each A64 JIT a 16 MiB fast dispatch table; on the PS4 that is
+direct memory. 128K/32K entries per frame (an overflow only waits for the
+worker) and 256K dispatch entries give back ~138 MiB for the GPU arena.
+---
+ src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h  | 7 +++++++
+ src/video_core/renderer_vulkan/vk_update_descriptor.h | 7 +++++++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+index 1310b4a..219e68c 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -60,8 +60,15 @@ public:
+         const void* code_ptr = nullptr;
+     };
+     static_assert(sizeof(FastDispatchEntry) == 0x10);
++#ifdef __ORBIS__
++    // PS4: 16 MiB per emulated core is direct memory the console does not have to spare; a
++    // smaller table only means more lookups miss and take the slow path.
++    static constexpr u64 fast_dispatch_table_mask = 0x3FFFF0;
++    static constexpr size_t fast_dispatch_table_size = 0x40000;
++#else
+     static constexpr u64 fast_dispatch_table_mask = 0xFFFFF0;
+     static constexpr size_t fast_dispatch_table_size = 0x100000;
++#endif
+ 
+     void ClearFastDispatchTable();
+     void GenMemory128Accessors();
+diff --git a/src/video_core/renderer_vulkan/vk_update_descriptor.h b/src/video_core/renderer_vulkan/vk_update_descriptor.h
+index 9f30e65..65b80f1 100644
+--- a/src/video_core/renderer_vulkan/vk_update_descriptor.h
++++ b/src/video_core/renderer_vulkan/vk_update_descriptor.h
+@@ -40,8 +40,15 @@ class UpdateDescriptorQueue final {
+     static constexpr size_t FRAMES_IN_FLIGHT = 8;
+ 
+ public:
++#ifdef __ORBIS__
++    // PS4: 8 frames x 512K entries x 24 bytes is 96 MiB of direct memory (+24 for compute) for
++    // payloads that use a few thousand entries a frame; an overflow only waits for the worker.
++    static constexpr size_t GUEST_FRAME_PAYLOAD_SIZE = 0x20000;
++    static constexpr size_t COMPUTE_FRAME_PAYLOAD_SIZE = 0x8000;
++#else
+     static constexpr size_t GUEST_FRAME_PAYLOAD_SIZE = 0x80000;
+     static constexpr size_t COMPUTE_FRAME_PAYLOAD_SIZE = 0x20000;
++#endif
+ 
+     explicit UpdateDescriptorQueue(const Device& device_, size_t frame_payload_size_,
+                                    bool supports_descriptor_buffer_ = false);
+-- 
+2.43.0
+

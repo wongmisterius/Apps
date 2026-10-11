@@ -278,8 +278,9 @@ void ApplyPs4Settings() {
     setenv("RADV_DEBUG", "info", 1);
     // The driver's GPU arena; the texture and buffer caches share it (patch 0031). Tomodachi
     // Life ran direct memory out at 1280 MiB (its guest RAM grows past 1.5 GiB) and the arena
-    // itself out at 1024 ("out of device VA"). settings.txt env=ORBIS_ARENA_MIB=... overrides.
-    setenv("ORBIS_ARENA_MIB", "1152", 1);
+    // itself out at 1024 and 1152 ("out of device/32-bit VA"); patch 0032 pays for 1280.
+    // settings.txt env=ORBIS_ARENA_MIB=... overrides.
+    setenv("ORBIS_ARENA_MIB", "1280", 1);
 }
 
 /// settings.txt: lines "key=value" ('#' starts a comment). Each recognized line is logged; any
@@ -494,7 +495,7 @@ void CheckMutexes() {
 int main() {
     Ps4::OpenBootLog();
     Ps4::Log("eden-ps4 starting (Eden %s %s)", Common::g_scm_branch, Common::g_scm_desc);
-    Ps4::Log("PS4 build: %s; tl4: tl3 + 1152 MiB arena shared by the texture and buffer caches",
+    Ps4::Log("PS4 build: %s; tl5: tl4 + 1280 MiB arena, smaller descriptor queues and JIT dispatch tables",
              EDEN_PS4_BUILD_ID);
     Ps4::InstallCrashReporting();
     Ps4::StartWatchdog();
