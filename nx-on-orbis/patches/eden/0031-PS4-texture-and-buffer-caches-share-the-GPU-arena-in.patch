@@ -1,0 +1,67 @@
+From 1dd12509e78dfbed905e6c5ce4a470d5fc3e6946 Mon Sep 17 00:00:00 2001
+From: nx-on-orbis <nx-on-orbis@localhost>
+Date: Sun, 11 Oct 2026 16:19:01 +0000
+Subject: [PATCH] PS4: texture and buffer caches share the GPU arena instead of
+ each budgeting 75% of it
+
+Each cache sized its collection thresholds from the whole driver arena
+(textures 55/65/75%, buffers 60/75%), so together they could ask for ~150%
+of it. Tomodachi Life hung with 'out of device VA' at 1024 MiB. Textures now
+collect from 42/50/58% and buffers from 18/25%, leaving room for the stream
+buffer.
+---
+ src/video_core/buffer_cache/buffer_cache.h   | 12 ++++++++----
+ src/video_core/texture_cache/texture_cache.h |  7 ++++---
+ 2 files changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 9f84064..6a168fc 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -39,8 +39,10 @@ BufferCache<P>::BufferCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, R
+         const char* value = std::getenv("ORBIS_ARENA_MIB");
+         const long mib = value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+         const s64 arena = static_cast<s64>(mib > 0 ? mib : 1024) * 1024 * 1024;
+-        minimum_memory = static_cast<u64>(arena * 60 / 100);
+-        critical_memory = static_cast<u64>(arena * 75 / 100);
++        // Shares the arena with the texture cache (42-58%) and the 128 MiB stream buffer: the
++        // two caches at 75% each could ask for 150% of it ("out of device VA", a hang).
++        minimum_memory = static_cast<u64>(arena * 18 / 100);
++        critical_memory = static_cast<u64>(arena * 25 / 100);
+ #endif
+         return;
+     }
+@@ -63,8 +65,10 @@ BufferCache<P>::BufferCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, R
+         const char* value = std::getenv("ORBIS_ARENA_MIB");
+         const long mib = value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+         const s64 arena = static_cast<s64>(mib > 0 ? mib : 1024) * 1024 * 1024;
+-        minimum_memory = static_cast<u64>(arena * 60 / 100);
+-        critical_memory = static_cast<u64>(arena * 75 / 100);
++        // Shares the arena with the texture cache (42-58%) and the 128 MiB stream buffer: the
++        // two caches at 75% each could ask for 150% of it ("out of device VA", a hang).
++        minimum_memory = static_cast<u64>(arena * 18 / 100);
++        critical_memory = static_cast<u64>(arena * 25 / 100);
+     }
+ #endif
+ }
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 87d14d6..1089f5f 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -160,9 +160,10 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
+ #ifdef __ORBIS__
+     {
+         const s64 arena = Ps4GpuArenaBytes();
+-        minimum_memory = static_cast<u64>(arena * 55 / 100);
+-        expected_memory = static_cast<u64>(arena * 65 / 100);
+-        critical_memory = static_cast<u64>(arena * 75 / 100);
++        // Its share of the arena; the buffer cache takes up to 25% and the stream buffer the rest.
++        minimum_memory = static_cast<u64>(arena * 42 / 100);
++        expected_memory = static_cast<u64>(arena * 50 / 100);
++        critical_memory = static_cast<u64>(arena * 58 / 100);
+         LOG_INFO(Render_Vulkan, "PS4 texture cache budget: arena {} MiB, collect from {} MiB, "
+                  "high priority {} MiB, aggressive {} MiB", arena >> 20, minimum_memory >> 20,
+                  expected_memory >> 20, critical_memory >> 20);
+-- 
+2.43.0
+
