@@ -52,3 +52,10 @@ el QR que expone `npm run watch`.
 - Los valores de decaimiento/evolución están en `src/common/pet.js`
   (constantes `DECAY` y `STAGE_THRESHOLDS`) para ajustar fácilmente el
   balance del juego.
+
+---
+
+## Otros proyectos en este repo
+
+- [`escaner-red-android/`](escaner-red-android/README.md): app Android para escanear la red WiFi,
+  registrar dispositivos en SQLite e identificar fabricante / MAC aleatoria.
