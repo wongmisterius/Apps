@@ -47,7 +47,7 @@ o si hay `.so` sin la variante armeabi-v7a.
 
 ## Compilar
 
-Lo compila GitHub Actions (`.github/workflows/sysdvr-tv.yml` en la raíz del repo) en cada push a `main`; los tags `v*` publican un Release con el APK.
+Lo compila GitHub Actions (`.github/workflows/sysdvr-tv.yml` en la raíz del repo) en cada push a `main`. Los tags `v*`, o ejecutar el workflow a mano con `release_tag`, publican un Release con el APK.
 
 ```
 ./gradlew assembleDebug

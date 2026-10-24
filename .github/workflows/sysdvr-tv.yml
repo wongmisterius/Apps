@@ -7,6 +7,11 @@ on:
   pull_request:
     paths: ['sysdvr-tv/**', '.github/workflows/sysdvr-tv.yml']
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag a crear y publicar como Release (ej. v0.1.0); vacío = sólo build'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -14,6 +19,9 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.release_tag || github.ref_name }}
+      IS_RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.release_tag, 'v') }}
     defaults:
       run:
         working-directory: sysdvr-tv
@@ -46,7 +54,7 @@ jobs:
           echo "== Contenido del APK =="
           unzip -l "$APK"
           echo "== aapt badging =="
-          "$AAPT" dump badging "$APK" | grep -E "package:|sdkVersion|targetSdkVersion|leanback|uses-feature|native-code|launchable" || true
+          "$AAPT" dump badging "$APK" | grep -E "package:|sdkVersion|SdkVersion|leanback|uses-feature|native-code|launchable" || true
           echo "== Librerías nativas =="
           LIBS=$(unzip -Z1 "$APK" | grep '^lib/' || true)
           if [ -z "$LIBS" ]; then
@@ -64,7 +72,7 @@ jobs:
         run: |
           mkdir -p dist
           cp app/build/outputs/apk/debug/app-debug.apk dist/sysdvr-tv.apk
-          cp dist/sysdvr-tv.apk "dist/sysdvr-tv-${GITHUB_REF_NAME//\//-}.apk"
+          cp dist/sysdvr-tv.apk "dist/sysdvr-tv-${TAG//\//-}.apk"
           sha256sum dist/*.apk | tee dist/SHA256SUMS.txt
 
       - uses: actions/upload-artifact@v4
@@ -73,12 +81,15 @@ jobs:
           path: sysdvr-tv/dist/
 
       - name: GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: env.IS_RELEASE == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          name: SysDVR TV ${{ github.ref_name }}
+          # Con workflow_dispatch el tag se crea sobre el commit construido
+          tag_name: ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
+          name: SysDVR TV ${{ env.TAG }}
           generate_release_notes: true
           files: |
             sysdvr-tv/dist/sysdvr-tv.apk
-            sysdvr-tv/dist/sysdvr-tv-${{ github.ref_name }}.apk
+            sysdvr-tv/dist/sysdvr-tv-${{ env.TAG }}.apk
             sysdvr-tv/dist/SHA256SUMS.txt
