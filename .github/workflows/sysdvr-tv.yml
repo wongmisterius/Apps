@@ -1,0 +1,81 @@
+name: sysdvr-tv build
+
+on:
+  push:
+    branches: [main, ccr-b361b914-0gr2lg]
+    tags: ['v*']
+  pull_request:
+    paths: ['sysdvr-tv/**', '.github/workflows/sysdvr-tv.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sysdvr-tv
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build (assembleDebug)
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Inspeccionar APK
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          AAPT=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)aapt
+          echo "== Contenido del APK =="
+          unzip -l "$APK"
+          echo "== aapt badging =="
+          "$AAPT" dump badging "$APK" | grep -E "package:|sdkVersion|targetSdkVersion|leanback|uses-feature|native-code|launchable" || true
+          echo "== Librerías nativas =="
+          LIBS=$(unzip -Z1 "$APK" | grep '^lib/' || true)
+          if [ -z "$LIBS" ]; then
+            # Sin .so el APK es independiente de la ABI: Android lo instala y
+            # ejecuta igual en un userspace armeabi-v7a (Chromecast con Google TV).
+            echo "El APK no contiene código nativo (100% Kotlin/Java): compatible con armeabi-v7a y arm64-v8a."
+          else
+            echo "$LIBS"
+            echo "$LIBS" | grep -q '^lib/armeabi-v7a/' || { echo "::error::Faltan librerías armeabi-v7a"; exit 1; }
+            BAD=$(echo "$LIBS" | grep -vE '^lib/(armeabi-v7a|arm64-v8a)/' || true)
+            [ -z "$BAD" ] || { echo "::error::ABIs inesperadas: $BAD"; exit 1; }
+          fi
+
+      - name: Preparar artefactos
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk dist/sysdvr-tv.apk
+          cp dist/sysdvr-tv.apk "dist/sysdvr-tv-${GITHUB_REF_NAME//\//-}.apk"
+          sha256sum dist/*.apk | tee dist/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sysdvr-tv-apk
+          path: sysdvr-tv/dist/
+
+      - name: GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: SysDVR TV ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            sysdvr-tv/dist/sysdvr-tv.apk
+            sysdvr-tv/dist/sysdvr-tv-${{ github.ref_name }}.apk
+            sysdvr-tv/dist/SHA256SUMS.txt

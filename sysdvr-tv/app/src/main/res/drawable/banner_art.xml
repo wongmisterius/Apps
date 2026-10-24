@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="160dp" android:height="90dp"
+    android:viewportWidth="160" android:viewportHeight="90">
+    <!-- Joy-Con izquierdo / pantalla / Joy-Con derecho -->
+    <path android:fillColor="#FF00B8D9"
+        android:pathData="M40,22h10v46h-10a8,8 0,0 1,-8 -8v-30a8,8 0,0 1,8 -8z" />
+    <path android:fillColor="#FF2B333B" android:pathData="M52,22h56v46h-56z" />
+    <path android:fillColor="#FFE60012"
+        android:pathData="M110,22h10a8,8 0,0 1,8 8v30a8,8 0,0 1,-8 8h-10z" />
+    <!-- Triángulo "play" -->
+    <path android:fillColor="#FFFFFFFF" android:pathData="M72,33l22,12l-22,12z" />
+</vector>

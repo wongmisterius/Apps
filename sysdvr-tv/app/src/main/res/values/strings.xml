@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SysDVR TV</string>
+    <string name="subtitle">Cliente SysDVR · TCP Bridge</string>
+    <string name="ip_label">IP de la consola</string>
+    <string name="ip_hint">192.168.1.101</string>
+    <string name="connect">Conectar</string>
+    <string name="consoles_header">Consolas en la red</string>
+    <string name="scanning">Buscando consolas (UDP 19999)…</string>
+    <string name="consoles_found">%d consola(s) encontrada(s)</string>
+    <string name="console_item">%1$s · SysDVR %2$s (proto %3$s)</string>
+    <string name="invalid_ip">IP inválida</string>
+    <string name="help">En la Switch: SysDVR en modo TCP Bridge y un juego abierto.</string>
+    <string name="reconnect">Reconectar</string>
+    <string name="back">Volver</string>
+    <string name="reconnecting">Reconectando…</string>
+    <string name="connecting">Conectando…</string>
+    <string name="decoder_error">No se pudo iniciar el decoder H.264: %s</string>
+</resources>

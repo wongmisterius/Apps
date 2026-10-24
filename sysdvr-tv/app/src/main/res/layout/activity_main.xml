@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingStart="64dp"
+        android:paddingTop="40dp"
+        android:paddingEnd="64dp"
+        android:paddingBottom="32dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/app_name"
+            android:textSize="36sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="24dp"
+            android:text="@string/subtitle"
+            android:textColor="@color/text_dim"
+            android:textSize="16sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:text="@string/ip_label"
+            android:textSize="18sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <EditText
+                android:id="@+id/ip_input"
+                android:layout_width="320dp"
+                android:layout_height="56dp"
+                android:background="@drawable/tv_input"
+                android:digits="0123456789."
+                android:hint="@string/ip_hint"
+                android:imeOptions="actionDone"
+                android:importantForAutofill="no"
+                android:inputType="text"
+                android:maxLines="1"
+                android:nextFocusRight="@+id/connect_button"
+                android:nextFocusDown="@+id/connect_button"
+                android:paddingStart="16dp"
+                android:paddingEnd="16dp"
+                android:textColor="@color/text"
+                android:textColorHint="@color/text_dim"
+                android:textSize="20sp" />
+
+            <Button
+                android:id="@+id/connect_button"
+                style="@style/TvButton"
+                android:layout_width="wrap_content"
+                android:layout_height="56dp"
+                android:layout_marginStart="16dp"
+                android:nextFocusLeft="@id/ip_input"
+                android:nextFocusUp="@id/ip_input"
+                android:text="@string/connect" />
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="32dp"
+            android:text="@string/consoles_header"
+            android:textSize="18sp" />
+
+        <TextView
+            android:id="@+id/scan_status"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:textColor="@color/text_dim"
+            android:textSize="14sp" />
+
+        <LinearLayout
+            android:id="@+id/console_list"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="@string/help"
+            android:textColor="@color/text_dim"
+            android:textSize="14sp" />
+    </LinearLayout>
+</ScrollView>
