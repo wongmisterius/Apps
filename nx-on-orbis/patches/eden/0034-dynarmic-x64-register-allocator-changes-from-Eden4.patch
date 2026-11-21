@@ -1,0 +1,275 @@
+From 1f9b92f5e405bfa3652014c8cc9763943aaeaa0f Mon Sep 17 00:00:00 2001
+From: nx-on-orbis <nx-on-orbis@localhost>
+Date: Sat, 21 Nov 2026 03:45:01 +0000
+Subject: [PATCH 34/35] dynarmic x64: register allocator changes from Eden4
+
+From Eden4 (github.com/xatyy/Eden4, GPL-3.0-or-later), itself after
+ProsperoEden's reg_alloc.cmake:
+- R13 is allocatable when fastmem is off (gpr_order already says so);
+- a register that must be vacated moves to a free callee-saved register
+  (RBX, R12, R13) before it is spilled to the stack;
+- EndOfAllocScope and ValueLocation only visit locations touched since the
+  last scope end, which speeds up block compilation.
+ps4_regalloc_r13 / ps4_regalloc_free_moves turn the first two off.
+dynarmic_tests pass with the host features limited to the PS4's Jaguar.
+---
+ .../src/dynarmic/backend/x64/reg_alloc.cpp    | 104 +++++++++++++++++-
+ .../src/dynarmic/backend/x64/reg_alloc.h      |  34 +++++-
+ 2 files changed, 130 insertions(+), 8 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp
+index 5a82883..407f319 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <algorithm>
++#include <cstdio>
+ #include <limits>
+ #include <numeric>
+ #include <utility>
+@@ -22,6 +23,17 @@
+ #include "dynarmic/backend/x64/stack_layout.h"
+ #include "dynarmic/backend/x64/verbose_debugging_output.h"
+ 
++extern "C" bool ps4_regalloc_r13;
++
++#ifdef DYNARMIC_PAGE_REUSE_TEST
++extern "C" long ps4_block_counter;
++extern "C" long ps4_trace_block;
++extern "C" int ps4_current_opcode;
++#    define PS4TRACE(...) do { if (ps4_block_counter == ps4_trace_block) { std::fprintf(stderr, "[RA op%d] ", ps4_current_opcode); std::fprintf(stderr, __VA_ARGS__); } } while (0)
++#else
++#    define PS4TRACE(...) do {} while (0)
++#endif
++
+ namespace Dynarmic::Backend::X64 {
+ 
+ static inline bool CanExchange(const HostLoc a, const HostLoc b) noexcept {
+@@ -264,6 +276,7 @@ HostLoc RegAlloc::UseImpl(BlockOfCode& code, IR::Value use_value, std::bitset<32
+ 
+     auto const* use_inst = use_value.GetInst();
+     HostLoc const current_location = *ValueLocation(use_inst);
++    PS4TRACE("Use %%%d at %zu\n", int(use_inst->GetName()), size_t(current_location));
+ 
+     if (HostLocIsRegister(current_location) && desired_locations.test(size_t(current_location))) {
+         LocInfo(current_location).ReadLock();
+@@ -315,6 +328,7 @@ HostLoc RegAlloc::UseScratchImpl(BlockOfCode& code, IR::Value use_value, std::bi
+ 
+ HostLoc RegAlloc::ScratchImpl(BlockOfCode& code, std::bitset<32> desired_locations) noexcept {
+     const HostLoc location = SelectARegister(desired_locations);
++    PS4TRACE("Scratch -> %zu\n", size_t(location));
+     MoveOutOfTheWay(code, location);
+     LocInfo(location).WriteLock();
+     return location;
+@@ -418,7 +432,8 @@ HostLoc RegAlloc::SelectARegister(std::bitset<32> desired_locations) const noexc
+             // at all costs, because theoretically skipping them is better than spilling
+             // all over the place - i also fixes bugs with high reg pressure
+             // %rbp must not be trashed, so skip it as well
+-            } else if (i == HostLoc::RBP || (i >= HostLoc::R13 && i <= HostLoc::R15)) {
++            } else if (i == HostLoc::RBP || i == HostLoc::R14 || i == HostLoc::R15 ||
++                       (i == HostLoc::R13 && !__atomic_load_n(&ps4_regalloc_r13, __ATOMIC_RELAXED))) {
+                 // skip, do not touch
+             // Intel recommends to reuse registers as soon as they're overwritable (DO NOT SPILL)
+             } else if (loc_info.IsEmpty()) {
+@@ -455,17 +470,33 @@ HostLoc RegAlloc::SelectARegister(std::bitset<32> desired_locations) const noexc
+     return HostLoc(it_final);
+ }
+ 
++#ifdef DYNARMIC_PAGE_REUSE_TEST
++extern "C" bool ps4_regalloc_full_scan;
++bool RegAlloc::full_scan_enabled() noexcept { return ps4_regalloc_full_scan; }
++#endif
++
+ std::optional<HostLoc> RegAlloc::ValueLocation(const IR::Inst* value) const noexcept {
+-    for (size_t i = 0; i < hostloc_info.size(); i++)
+-        if (hostloc_info[i].ContainsValue(value)) {
+-            //for (size_t j = 0; j < hostloc_info.size(); ++j)
+-            //    ASSERT((i == j || !hostloc_info[j].ContainsValue(value)) && "duplicate defs");
+-            return HostLoc(i);
++#ifdef DYNARMIC_PAGE_REUSE_TEST
++    if (full_scan_enabled()) {
++        for (size_t i = 0; i < hostloc_info.size(); i++)
++            if (hostloc_info[i].ContainsValue(value))
++                return HostLoc(i);
++        return std::nullopt;
++    }
++#endif
++    // Only locations that held values at the last scope end or changed since, in ascending order.
++    for (size_t word = 0; word < live.size(); ++word) {
++        for (u64 bits = live[word] | touched[word]; bits != 0; bits &= bits - 1) {
++            const size_t i = word * 64 + size_t(std::countr_zero(bits));
++            if (hostloc_info[i].ContainsValue(value))
++                return HostLoc(i);
+         }
++    }
+     return std::nullopt;
+ }
+ 
+ void RegAlloc::DefineValueImpl(BlockOfCode& code, IR::Inst* def_inst, HostLoc host_loc) noexcept {
++    PS4TRACE("Define %%%d at %zu\n", int(def_inst->GetName()), size_t(host_loc));
+     ASSERT(!ValueLocation(def_inst) && "def_inst has already been defined");
+     LocInfo(host_loc).AddValue(host_loc, def_inst);
+     ASSERT(*ValueLocation(def_inst) == host_loc);
+@@ -485,6 +516,15 @@ void RegAlloc::DefineValueImpl(BlockOfCode& code, IR::Inst* def_inst, const IR::
+ }
+ 
+ void RegAlloc::Move(BlockOfCode& code, HostLoc to, HostLoc from) noexcept {
++#ifdef DYNARMIC_PAGE_REUSE_TEST
++    if (ps4_block_counter == ps4_trace_block) {
++        std::fprintf(stderr, "[RA op%d] Move %zu <- %zu holds:", ps4_current_opcode, size_t(to), size_t(from));
++        for (const IR::Inst* v : LocInfo(from).values) std::fprintf(stderr, " %%%d", int(v->GetName()));
++        std::fprintf(stderr, " | dest holds:");
++        for (const IR::Inst* v : LocInfo(to).values) std::fprintf(stderr, " %%%d", int(v->GetName()));
++        std::fprintf(stderr, "\n");
++    }
++#endif
+     const size_t bit_width = LocInfo(from).GetMaxBitWidth();
+     ASSERT(LocInfo(to).IsEmpty() && !LocInfo(from).IsLocked());
+     ASSERT(bit_width <= HostLocBitWidth(to));
+@@ -499,6 +539,15 @@ void RegAlloc::CopyToScratch(BlockOfCode& code, size_t bit_width, HostLoc to, Ho
+ }
+ 
+ void RegAlloc::Exchange(BlockOfCode& code, HostLoc a, HostLoc b) noexcept {
++#ifdef DYNARMIC_PAGE_REUSE_TEST
++    if (ps4_block_counter == ps4_trace_block) {
++        std::fprintf(stderr, "[RA op%d] Exchange %zu <-> %zu a:", ps4_current_opcode, size_t(a), size_t(b));
++        for (const IR::Inst* v : LocInfo(a).values) std::fprintf(stderr, " %%%d", int(v->GetName()));
++        std::fprintf(stderr, " b:");
++        for (const IR::Inst* v : LocInfo(b).values) std::fprintf(stderr, " %%%d", int(v->GetName()));
++        std::fprintf(stderr, "\n");
++    }
++#endif
+     ASSERT(!LocInfo(a).IsLocked() && !LocInfo(b).IsLocked());
+     ASSERT(LocInfo(a).GetMaxBitWidth() <= HostLocBitWidth(b));
+     ASSERT(LocInfo(b).GetMaxBitWidth() <= HostLocBitWidth(a));
+@@ -513,14 +562,57 @@ void RegAlloc::Exchange(BlockOfCode& code, HostLoc a, HostLoc b) noexcept {
+     }
+ }
+ 
++extern "C" {
++#ifdef DYNARMIC_PAGE_REUSE_TEST
++long ps4_regalloc_move_limit = 1L << 50;
++bool ps4_regalloc_full_scan = false;
++long ps4_block_counter = 0;
++long ps4_trace_block = -1;
++int ps4_current_opcode = -1;
++bool ps4_dump_block = false;
++#endif
++// settings.txt "regalloc=off" clears these (frontend/main.cpp). From Eden4.
++bool ps4_regalloc_free_moves = true;
++bool ps4_regalloc_r13 = true;
++}
++
+ void RegAlloc::MoveOutOfTheWay(BlockOfCode& code, HostLoc reg) noexcept {
+     ASSERT(!LocInfo(reg).IsLocked());
+     if (!LocInfo(reg).IsEmpty()) {
++        // A free callee-saved register before a stack slot (ProsperoEden's reg_alloc.cmake measured
++        // stack spills at about 8% of the samples in hot blocks). Only callee-saved ones: several
++        // emitters release their argument registers (EndOfAllocScope) before the call that reads
++        // them, so a caller-saved register that merely looks free can still hold an argument.
++        // RBX, R12 and R13 are never used that way (R13 only when fastmem is off, as gpr_order says).
++#ifdef DYNARMIC_PAGE_REUSE_TEST
++        static long ps4_move_count = 0;
++        const bool ps4_allow = ps4_move_count < ps4_regalloc_move_limit;
++#else
++        const bool ps4_allow = true;
++#endif
++        if (ps4_allow && HostLocIsGPR(reg) && __atomic_load_n(&ps4_regalloc_free_moves, __ATOMIC_RELAXED)) {
++            static constexpr HostLoc order[] = {HostLoc::RBX, HostLoc::R12, HostLoc::R13};
++            for (const HostLoc to : order) {
++                if (to != reg && gpr_order.test(size_t(to)) && hostloc_info[size_t(to)].IsEmpty() &&
++                    (to != HostLoc::R13 || __atomic_load_n(&ps4_regalloc_r13, __ATOMIC_RELAXED))) {
++#ifdef DYNARMIC_PAGE_REUSE_TEST
++                    if (ps4_move_count == ps4_regalloc_move_limit - 1 && ps4_regalloc_move_limit < (1L << 40)) {
++                        std::fprintf(stderr, "LAST FREE MOVE #%ld: %zu -> %zu (opcode %d) in compile #%ld\n", ps4_move_count, size_t(reg), size_t(to), ps4_current_opcode, ps4_block_counter);
++                        ps4_dump_block = true;
++                    }
++                    ++ps4_move_count;
++#endif
++                    Move(code, to, reg);
++                    return;
++                }
++            }
++        }
+         SpillRegister(code, reg);
+     }
+ }
+ 
+ void RegAlloc::SpillRegister(BlockOfCode& code, HostLoc loc) noexcept {
++    PS4TRACE("Spill %zu\n", size_t(loc));
+     ASSERT(HostLocIsRegister(loc) && "Only registers can be spilled");
+     ASSERT(!LocInfo(loc).IsEmpty() && "There is no need to spill unoccupied registers");
+     ASSERT(!LocInfo(loc).IsLocked() && "Registers that have been allocated must not be spilt");
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h
+index 455c6a9..054851b 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h
+@@ -9,8 +9,10 @@
+ #pragma once
+ 
+ #include <array>
++#include <bit>
+ #include <functional>
+ #include <optional>
++#include <utility>
+ 
+ #include "boost/container/small_vector.hpp"
+ #include "common/common_types.h"
+@@ -201,8 +203,27 @@ public:
+     void ReleaseStackSpace(BlockOfCode& code, const size_t stack_space) noexcept;
+ 
+     inline void EndOfAllocScope() noexcept {
+-        for (auto& iter : hostloc_info)
+-            iter.ReleaseAll();
++#ifdef DYNARMIC_PAGE_REUSE_TEST
++        if (full_scan_enabled()) {
++            for (size_t i = 0; i < hostloc_info.size(); ++i) {
++                hostloc_info[i].ReleaseAll();
++                const u64 bit = u64(1) << (i % 64);
++                live[i / 64] = hostloc_info[i].IsEmpty() ? (live[i / 64] & ~bit) : (live[i / 64] | bit);
++            }
++            touched.fill(0);
++            return;
++        }
++#endif
++        // Only the locations changed since the last scope end can need releasing: the others were
++        // released then and ReleaseAll is idempotent. Idea from ProsperoEden's reg_alloc.cmake.
++        for (size_t word = 0; word < touched.size(); ++word) {
++            for (u64 bits = std::exchange(touched[word], 0); bits != 0; bits &= bits - 1) {
++                const size_t i = word * 64 + size_t(std::countr_zero(bits));
++                hostloc_info[i].ReleaseAll();
++                const u64 bit = u64(1) << (i % 64);
++                live[word] = hostloc_info[i].IsEmpty() ? (live[word] & ~bit) : (live[word] | bit);
++            }
++        }
+     }
+     inline void AssertNoMoreUses() noexcept {
+         ASSERT(std::all_of(hostloc_info.begin(), hostloc_info.end(), [](const auto& i) noexcept { return i.IsEmpty(); }));
+@@ -235,6 +256,7 @@ private:
+ 
+     inline HostLocInfo& LocInfo(const HostLoc loc) noexcept {
+         DEBUG_ASSERT(loc != HostLoc::RSP && loc != ABI_JIT_PTR);
++        touched[size_t(loc) / 64] |= u64(1) << (size_t(loc) % 64);
+         return hostloc_info[size_t(loc)];
+     }
+     inline const HostLocInfo& LocInfo(const HostLoc loc) const noexcept {
+@@ -250,6 +272,14 @@ private:
+     std::bitset<32> gpr_order;
+     std::bitset<32> xmm_order;
+     size_t reserved_stack_space = 0;
++    // Locations changed since the last EndOfAllocScope, and locations that held values at that
++    // point; no other location can hold a value.
++#ifdef DYNARMIC_PAGE_REUSE_TEST
++    static bool full_scan_enabled() noexcept;
++#endif
++    static constexpr size_t location_words = (NonSpillHostLocCount + SpillCount + 63) / 64;
++    std::array<u64, location_words> touched{};
++    std::array<u64, location_words> live{};
+ };
+ 
+ }  // namespace Dynarmic::Backend::X64
+-- 
+2.43.0
+

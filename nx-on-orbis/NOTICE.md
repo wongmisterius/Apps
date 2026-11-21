@@ -14,6 +14,9 @@ modules noted below.
 - `testroms/hbmenu.nro`: switchbrew nx-hbmenu v3.6.1, ISC (`testroms/hbmenu-LICENSE.txt`).
 - `tools/perl5/Locale/Maketext/Simple.pm`: a stub of the Perl module of that name, used only while
   building OpenSSL.
+- `patches/eden/0034` and `0035`: ported from [Eden4](https://github.com/xatyy/Eden4)
+  (GPL-3.0-or-later): Dynarmic's register allocator changes (themselves after ProsperoEden) and the
+  staging buffer cap / GPU memory reclaim.
 
 ## The binary release
 

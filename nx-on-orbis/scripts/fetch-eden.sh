@@ -32,5 +32,5 @@ git config core.autocrlf false
 git add -A
 git -c user.name=base -c user.email=base@localhost commit -q -m "Eden ${COMMIT:0:12} (pristine, ProsperoEden pin)"
 git am -q --keep-cr "$ROOT"/patches/eden/*.patch
-git log --oneline | head -3
+git log --oneline -3
 echo "Eden ready in $DEST"
