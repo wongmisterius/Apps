@@ -501,7 +501,7 @@ void CheckMutexes() {
 int main() {
     Ps4::OpenBootLog();
     Ps4::Log("eden-ps4 starting (Eden %s %s)", Common::g_scm_branch, Common::g_scm_desc);
-    Ps4::Log("PS4 build: %s; tl9: tl6 again (both Eden4 patches removed: tl7 hung, tl8 crashed at start)",
+    Ps4::Log("PS4 build: %s; tl10: tl9 + serialized Eden log writes (log text was corrupting the heap)",
              EDEN_PS4_BUILD_ID);
     Ps4::InstallCrashReporting();
     Ps4::StartWatchdog();

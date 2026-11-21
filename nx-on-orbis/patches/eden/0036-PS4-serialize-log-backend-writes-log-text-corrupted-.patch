@@ -1,0 +1,68 @@
+From ddaf4c90905665442d9218ee94ebbb8727ef2f87 Mon Sep 17 00:00:00 2001
+From: nx-on-orbis <nx-on-orbis@localhost>
+Date: Sat, 21 Nov 2026 04:40:15 +0000
+Subject: [PATCH] PS4: serialize log backend writes (log text corrupted the
+ heap)
+
+FmtLogMessageImpl calls every backend from whatever thread logs, and the
+file backend writes one shared FILE. OpenOrbis' musl does not know about
+threads the console creates, so it does not lock FILEs: concurrent writes
+corrupted the FILE buffer pointers and spilled log text into neighbouring
+heap objects. On the console KernelCore's mutexes were found holding
+"Service.FS <" and "chive 'F" when the app crashed starting Tomodachi
+Life, and eden_log.txt always had interleaved and duplicated lines.
+---
+ src/common/logging.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/common/logging.cpp b/src/common/logging.cpp
+index ed12d52..3fa3497 100644
+--- a/src/common/logging.cpp
++++ b/src/common/logging.cpp
+@@ -21,6 +21,7 @@
+ #include <unistd.h>
+ #endif
+ 
++#include <mutex>
+ #include <boost/algorithm/string/replace.hpp>
+ #include <fmt/ranges.h>
+ 
+@@ -405,10 +406,22 @@ void Initialize() {
+     }
+ }
+ 
++#ifdef __ORBIS__
++// PS4: the backends are called from every emulator thread at once, and the file backend writes
++// one shared FILE. OpenOrbis' musl never learns about threads the console creates, so it does
++// not lock its FILEs: concurrent writes corrupted the buffer pointers and spilled log text over
++// neighbouring heap objects (KernelCore's mutexes held "Service.FS <..." when the app crashed,
++// and eden_log.txt always had interleaved lines). One lock around the backends fixes both.
++static std::mutex g_ps4_log_write_mutex;
++#endif
++
+ void Start() {
+ }
+ 
+ void Stop() {
++#ifdef __ORBIS__
++    std::scoped_lock ps4_log_lock{g_ps4_log_write_mutex};
++#endif
+     if (logging_instance)
+         logging_instance->ForEachBackend([](Backend& backend) { backend.Flush(); });
+ }
+@@ -423,8 +436,12 @@ void SetColorConsoleBackendEnabled(bool enabled) {
+         logging_instance->color_console_backend.enabled = enabled;
+ }
+ 
++
+ void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename, unsigned int line_num, const char* function, fmt::string_view format, const fmt::format_args& args) {
+     if (logging_instance && logging_instance->filter.CheckMessage(log_class, log_level)) {
++#ifdef __ORBIS__
++        std::scoped_lock ps4_log_lock{g_ps4_log_write_mutex};
++#endif
+         auto const flush = ::Settings::values.log_flush_line.GetValue();
+         char buffer[BUFSIZ];
+         auto result = fmt::vformat_to_n(buffer, sizeof(buffer) - 1, format, args);
+-- 
+2.43.0
+
