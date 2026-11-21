@@ -65,3 +65,31 @@ Líneas nuevas en `boot.log`:
   líneas `status:` de `boot.log`.
 - **FW 13.52**: el armado del paquete (firma, `sce_module/`) se validó en 12.02. Si no abre o da
   poca memoria (`boot.log` lo reporta al inicio), es lo primero a revisar.
+
+## Versiones después de tl1
+
+| Versión | Cambio | Motivo (logs de la consola) |
+|---|---|---|
+| tl2 | Stream buffer 128 MiB, arena GPU 1024 MiB | v0.1.0/tl1 se quedaban sin memoria directa (~260-300 s) |
+| tl3 | Idioma del juego = idioma de la PS4 (`language=` en `settings.txt`) | Eden fija inglés (EE. UU.) |
+| tl4 | Las cachés de texturas y buffers se reparten la arena (parche 0031) | tl2: `out of device VA` con 1024 MiB |
+| tl5 | Colas de descriptores y tablas JIT más chicas, arena 1280 MiB (0032) | tl4: `out of 32-bit VA` (sombreadores) |
+| tl6 | Lecturas IPC grandes directo a la memoria emulada (0033), `cpu_accuracy=unsafe`, log de reservas grandes | tl5: ~900 MiB de heap pedidos de golpe al cargar la isla |
+| tl7 | Asignador de registros de Dynarmic (0034) y reintento ante poca memoria GPU (0035), de Eden4 | Rendimiento al cargar y robustez de memoria |
+
+## Comparación con Eden4
+
+[Eden4](https://github.com/xatyy/Eden4) es otro port de Eden a PS4 (con su propio Mesa, menú HOME y
+varios mandos). De él se portó lo que aplica a este diseño:
+
+- **Asignador de registros** (0034): R13 utilizable sin fastmem, movimientos a registros libres en
+  lugar de `spill` a la pila, y compilación de bloques más rápida. Validado en PC con
+  `dynarmic_tests` limitando el CPU a las instrucciones del Jaguar (131/131 casos).
+  `regalloc=off` en `settings.txt` lo desactiva.
+- **Memoria de GPU** (0035): staging limitado a 64 MiB y, si una reserva falla, esperar a la GPU,
+  liberar y reintentar en lugar de cerrar.
+
+Lo que **no** se portó, porque resuelve limitaciones de Eden4 que aquí no existen: su tabla de páginas
+en dos niveles con tabla espejo (aquí la tabla es plana con commit perezoso: una sola lectura) y la
+protección por ventanas del caché de código (aquí el caché queda siempre RWX). Eden4 además reserva
+los 4 GiB de la Switch al inicio (solo ~480 MiB para la GPU) y no soporta el modo PS4 Pro.
