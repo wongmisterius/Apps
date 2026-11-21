@@ -73,12 +73,6 @@ extern int ps4_rg_mode;      // vk_texture_cache.cpp
 extern int ps4_a2b10_mode;   // vk_texture_cache.cpp
 }
 
-extern "C" {
-// dynarmic/backend/x64/reg_alloc.cpp (patch 0034).
-extern bool ps4_regalloc_r13;
-extern bool ps4_regalloc_free_moves;
-}
-
 namespace {
 
 /// Touch pad as the Switch touch screen (settings.txt touchpad=off disables it). Clicking the pad
@@ -380,11 +374,6 @@ void ApplySettingsFile() {
             v.cpu_accuracy.SetValue(value == "unsafe" ? Settings::CpuAccuracy::Unsafe
                                     : value == "auto" ? Settings::CpuAccuracy::Auto
                                                       : Settings::CpuAccuracy::Accurate);
-        } else if (key == "regalloc" && (value == "on" || value == "off")) {
-            // Eden4's register allocator changes (patch 0034): R13 and moves to free
-            // callee-saved registers instead of stack spills.
-            ps4_regalloc_r13 = value == "on";
-            ps4_regalloc_free_moves = value == "on";
         } else if (key == "touchpad" && (value == "on" || value == "off")) {
             g_touchpad = value == "on";
         } else if (key == "docked" && (value == "on" || value == "off")) {
@@ -512,7 +501,7 @@ void CheckMutexes() {
 int main() {
     Ps4::OpenBootLog();
     Ps4::Log("eden-ps4 starting (Eden %s %s)", Common::g_scm_branch, Common::g_scm_desc);
-    Ps4::Log("PS4 build: %s; tl7: tl6 + Eden4 register allocator and GPU memory reclaim",
+    Ps4::Log("PS4 build: %s; tl8: tl6 + Eden4 GPU memory reclaim (Eden4 register allocator removed: tl7 hung before the first frame)",
              EDEN_PS4_BUILD_ID);
     Ps4::InstallCrashReporting();
     Ps4::StartWatchdog();
